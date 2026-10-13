@@ -27,7 +27,7 @@ clone while `settings.local.json` stays per-user. Before that, a session had to 
 procedure verbatim in its prompt and a fresh clone could not run §7 at all. A scheduled run now
 only needs: *run the `autofix-issues` skill*. The corpora the scorer reads are public and are
 not committed here: `fetch-corpora.sh` (next to this file) clones each one at a pinned commit
-into `$CORPUS_ROOT` (§7). A runner where that check fails must skip precision fixes per §2.
+(or downloads a pinned archive and verifies its SHA-256) into `$CORPUS_ROOT` (§7). A runner where that check fails must skip precision fixes per §2.
 
 ## Autonomy contract
 
@@ -359,7 +359,9 @@ in one comment and label `needs-decision`. Never pick an option silently in a fi
 "no new test failures" is NOT a sufficient gate for them, because dropping a true positive
 fails no existing test. They may proceed only when the language has a pinned corpus for the
 §7 benchmark differential (Java: OWASP + SecuriBench; Python: BenchmarkPython; JS/TS:
-nodegoat + juice-shop + dvna) and `fetch-corpora.sh check <language>` exits 0. Run
+nodegoat + juice-shop + dvna; C#: Juliet C# 1.3; Go: gosec `testutils/` + semgrep-rules `go/`;
+Rust: semgrep-rules `rust/`; bash: semgrep-rules `bash/`) and `fetch-corpora.sh check
+<language>` exits 0. HTML has no corpus, so HTML precision fixes stay ineligible. Run
 `fetch-corpora.sh fetch <language>` first if the corpus is merely not downloaded yet. If the
 check still fails, the fix is NOT minor → skip with reason "no benchmark gate: <the
 MISSING / DRIFT / DIRTY line the check printed>". Do not skip for a missing corpus without
@@ -466,11 +468,12 @@ and move on.
   repository that the runner sets in its environment. There is no default: the step fails
   when it is unset. Before any snapshot, fetch and verify the corpora for the fix's language:
   ```
-  .claude/skills/autofix-issues/fetch-corpora.sh fetch <language>   # clones what is missing, at the pinned commit
+  .claude/skills/autofix-issues/fetch-corpora.sh fetch <language>   # fetches what is missing, at the pinned commit / archive hash
   .claude/skills/autofix-issues/fetch-corpora.sh check <language>   # read-only; must exit 0
   ```
   `check` exits non-zero and names the corpus when one is missing, at a different commit, or
-  has local changes. Never snapshot a corpus that did not pass it, and never edit files
+  has local changes. For an archive pin, it recomputes the hash of every extracted file against
+  the `.fetch-corpora-pin` marker written at fetch time, so an edited, added or deleted file fails too. Never snapshot a corpus that did not pass it, and never edit files
   under `$CORPUS_ROOT`. The pins are the table at the top of `fetch-corpora.sh`
   (`fetch-corpora.sh list`); changing a pin is a human decision, not part of a fix. Pick by
   language of the fix:
@@ -479,9 +482,29 @@ and move on.
   |---|---|---|---|
   | java | `.owasp-benchmark-java/src/main/java/org/owasp/benchmark/testcode` + `securibench-micro` | `.owasp-benchmark-java/expectedresults-1.2.csv` | OWASP ≈ 22 min per snapshot |
   | python | `benchmark-python/testcode` | `benchmark-python/expectedresults-0.1.csv` | |
-  | csharp | `juliet-csharp` with `--filter 'CWE<nn>_'` for the fix's CWE (46k files total) | none | not pinned yet (a NIST archive, not a git repository), so `check csharp` fails and C# precision fixes are **not eligible** until a pin is added |
+  | csharp | `juliet-csharp/src/testcases` with `--filter 'CWE<nn>_'` for the fix's CWE (47,126 files under `CWE*/`) | none | NIST SARD archive pinned by SHA-256. Labels are in the method names: a finding inside a `Bad*` method (`Bad`, `BadSink`, …) should fire, one inside `Good*` (`GoodG2B`, `GoodB2GSink`, …) should not. A removal inside a `Bad*` method is a TP loss |
   | javascript / typescript | `nodegoat`, `juice-shop`, `dvna` | none | small; no TP labels → treat every removal as review |
-  | go / rust / bash / html | none | — | **not eligible for a precision auto-fix** |
+  | go | `gosec/testutils` + `semgrep-rules/go` | none | see the gosec and semgrep-rules scoring below |
+  | rust | `semgrep-rules/rust` | none | semgrep-rules scoring below |
+  | bash | `semgrep-rules/bash` | none | semgrep-rules scoring below |
+  | html | none | — | **not eligible for a precision auto-fix** |
+
+  **Scoring semgrep-rules** (go / rust / bash). Each rule ships test files whose annotations
+  label the line *after* the comment: `ruleid: <id>` means that line should fire, `ok: <id>`
+  means it should not. Snapshot the language subdirectory and `diff` without `--expected`.
+  Then label every `REMOVED`/`ADDED` row by its sink line. A removal on a `ruleid:` line is a
+  **TP loss** and fails the gate, the same as a real=true removal. A removal on an `ok:` line is
+  the expected FP removal. A removal on an unannotated line needs review, as for JS. Report
+  the counts of findings on `ruleid:` and `ok:` lines, before and after, in the PR body.
+  **Licence:** semgrep-rules is under the Semgrep Rules License, so it is a **local benchmark
+  only**. Never copy its files, rules or snippets into this repository (no fixtures, no test
+  strings); write fixtures for the fix by hand instead.
+
+  **Scoring gosec `testutils/`.** The Go samples are string literals in `g<nnn>_samples.go`
+  tables, each paired with its expected issue count. Snapshotting the directory therefore
+  scores only the harness. For the rule the fix touches, write each sample to its own `.go`
+  file in a scratch directory outside the repo and snapshot that. Samples with count > 0 should
+  fire, so a removal there is a TP loss. Samples with count 0 should not fire.
 
   Procedure (BASE = the main SHA the branch started from):
   ```
