@@ -73,7 +73,7 @@ function runReport(service, action, { curl = true, jq = true, key = 'test-key', 
   };
   if (key != null) env.CURSOR_API_KEY = key;
   let code = 0;
-  let stdout = '';
+  let stdout;
   let stderr = '';
   try {
     stdout = execFileSync(BASH, [SCRIPT, service, action], {
@@ -152,7 +152,7 @@ test('missing curl and jq do not abort release.sh', () => {
   assert.match(release, /RELEASE_STOP_AFTER_PREREQ:-[\s\S]*exit 0/);
 
   let code = 0;
-  let stdout = '';
+  let stdout;
   let stderr = '';
   try {
     stdout = execFileSync(BASH, [RELEASE, 'patch'], {
