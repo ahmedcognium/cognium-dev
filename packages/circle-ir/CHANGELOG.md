@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Java: `setSecure(true)` credits that cookie only (#595).** A second cookie that calls `setSecure(false)`, or never sets the flag, is still insecure-cookie. One cookie with both flags set stays clean.
+- **Java: Undertow `ResourceManager.getResource` is a path sink (#622).** `ResourceManager`, `PathResourceManager`, `FileResourceManager`, and `ClassPathResourceManager`, class-qualified. A literal path stays clean.
+- **A sanitizer on one operand no longer clears the whole sink (#641).** `println(escapeHtml4(a) + b)` and `res.send(escapeHtml(a) + b)` are reported. Both operands escaped stays clean.
+- **Go: `r.PostForm.Get(k)`, `r.Form.Get(k)` and the index form `r.Form[k][0]` on a declared `*http.Request` are taint sources (#492).** A plain `url.Values.Get` is unchanged.
+- **Secrets: OpenAI project keys (`sk-proj-…`) are detected (#551).** The body floor is 48 characters. Padded placeholders are skipped.
+- **Secrets: a Stripe publishable key (`pk_live_…`) is reported at `low` / `note` instead of `high` / `warning` (#552).** Publishable keys are meant to be embedded in a client; the finding stays so the key is visible.
+- **Secrets: GitHub fine-grained personal access tokens (`github_pat_…`) are detected (#553).** Padded placeholders are skipped.
+
 ## [4.14.1] - 2026-10-11
 
 ### Fixed
