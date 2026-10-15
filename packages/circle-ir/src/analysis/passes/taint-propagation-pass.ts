@@ -296,6 +296,7 @@ function makeConstPropVeto(
   sources: SinkFilterResult['sources'],
   code: string | undefined,
   language?: string,
+  sanitizers?: SinkFilterResult['sanitizers'],
 ): (step: { variable: string; line: number }, sourceLine: number, sinkLine: number, sinkType?: string) => boolean {
   const lines = typeof code === 'string' ? code.split('\n') : [];
   const selfReassign = new Map<string, number[]>();
@@ -353,6 +354,39 @@ function makeConstPropVeto(
     // which vetoed every C# flow through one while `var s = q;` passed. Dead
     // code and resolved constants (the reasons above) still apply.
     if (language === 'csharp') return false;
+    // cognium-dev#582: in JS/TS a use after an `if` / `else` / `switch` has the
+    // outer def and the block's def both reaching it (the DFG lists one use per
+    // reaching def). const-prop has no model of the block's assignment, so its
+    // "untainted" is only the outer def's value; when any reaching def is the
+    // source's own assignment the verdict is "never looked", not "clean".
+    // Keep the veto when that source assignment itself passes through a
+    // sanitizer (`n = escapeHtml(req.query.n)` in a branch): skipping would
+    // report xss while main and the straight-line form stay clean.
+    if ((language === 'javascript' || language === 'typescript')) {
+      const reaching = (graph.usesByLine.get(step.line) ?? [])
+        .filter(u => u.variable === step.variable && u.def_id != null)
+        .map(u => graph.defById.get(u.def_id!))
+        .filter((d): d is NonNullable<typeof d> => !!d);
+      const sourceReaches = reaching.filter(d => d.line === sourceLine &&
+        sources.some(s => s.line === sourceLine && !CONTAINER_READ_SOURCES.has(s.type)));
+      if (reaching.length > 1 && sourceReaches.length > 0) {
+        const sansAtSource = (sanitizers ?? []).filter(s => s.line === sourceLine);
+        const srcText = lines[sourceLine - 1] ?? '';
+        const sourceSanitized = sourceReaches.some(d => {
+          const relevant = sinkType
+            ? sansAtSource.filter(s => sanitizerCoversSink(s, sinkType))
+            : sansAtSource;
+          if (relevant.length === 0) return false;
+          const v = escape(d.variable);
+          const dm = new RegExp(`(?:^|[^\\w$.])${v}\\s*=(?!=)(.*)$`).exec(srcText);
+          if (!dm) return false;
+          const wrapType = sinkType ?? relevant[0]?.sanitizes?.[0];
+          if (!wrapType) return false;
+          return expressionFullyWrappedBySanitizer(dm[1], relevant, wrapType);
+        });
+        if (!sourceSanitized) return false;
+      }
+    }
     const lo = Math.min(sourceLine, sinkLine);
     // Walk the reaching-def chain back from this step, stepping through
     // self-derived reassignments only. Reaching defs are per method, so a
@@ -407,7 +441,7 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
 
     // cognium-dev#328 — scoped exemption from const-prop's `variable_not_tainted`
     // veto for self-derived reassignment (`x = f(x)`, `x += y`), the #287 shape.
-    const isVetoed = makeConstPropVeto(constProp, graph, sources, ctx.code, ctx.language);
+    const isVetoed = makeConstPropVeto(constProp, graph, sources, ctx.code, ctx.language, sanitizers);
 
     // Filter flows: eliminate dead-code paths and constant-propagation FPs
     const verifiedFlows = propagationResult.flows.filter(flow => {

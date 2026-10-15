@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Python scan reports a finding for a value passed through a same-file `strip()`/`lower()`/`str()`-only helper named like a sanitizer (#581, partial).
 - A Java scan reports `trust_boundary` for a value stored in a session after passing through a same-file helper that only HTML-encodes it (#589, partial).
 - A C# scan reports `command_injection` for a `ProcessStartInfo` local with a tainted `FileName` (or tainted `Arguments` behind a shell) passed to `Process.Start(psi)` (#594, partial).
+- A JS/TS scan reports a command, path or SQL sink fed by a variable that is assigned the tainted value inside an `if` / `else` / loop body or a `switch` case before the sink (#582, partial).
 - Bundles the circle-ir changes listed under circle-ir [Unreleased].
 
 ## [4.15.0] - 2026-10-15
