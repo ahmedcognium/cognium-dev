@@ -24,6 +24,8 @@ import type { TaintMatcherResult } from './taint-matcher-pass.js';
 import type { ConstantPropagatorResult } from './constant-propagation-pass.js';
 import { attachSourceLineCode } from '../taint-matcher.js';
 import { javaReplaceCrLfCoverage } from '../java-crlf-strip.js';
+import { javaCallArgument, javaCanonicalBaseLacksSeparator } from '../java-canonical-prefix.js';
+import { findGoStringsReplacerSanitizers } from '../go-strings-replacer.js';
 
 // ---------------------------------------------------------------------------
 // Pattern tables (moved from analyzer.ts)
@@ -349,6 +351,8 @@ export class LanguageSourcesPass implements AnalysisPass<LanguageSourcesResult> 
       additionalSanitizers.push(...findGoMapAllowlistGuardSanitizers(code));
       additionalSanitizers.push(...findGoHtmlTemplateImportSanitizers(code));
       additionalSanitizers.push(...findGoPathContainmentGuardSanitizers(code));
+      // #348 / #293: strings.NewReplacer CR/LF strip and < > entity escape.
+      additionalSanitizers.push(...findGoStringsReplacerSanitizers(code));
       // Sprint 78 (#190): Go ECB-mode weak-crypto detection.
       const goMisconfigFindings = findGoPatternFindings(code, graph.ir.meta.file);
       for (const finding of goMisconfigFindings) {
@@ -670,6 +674,8 @@ export class LanguageSourcesPass implements AnalysisPass<LanguageSourcesResult> 
       // cognium-dev#269: `!file.getCanonicalPath().startsWith(base)` reject
       // guard (the java.io.File OWASP-recommended containment defence).
       additionalSanitizers.push(...findJavaCanonicalPathStartsWithGuardSanitizers(code));
+      // cognium-dev#293: `if (!Set.of("a", "b").contains(key)) throw` allow-list guard.
+      additionalSanitizers.push(...findJavaLiteralAllowlistGuardSanitizers(code));
       additionalSanitizers.push(...findJavaInlineCrlfStripLogSanitizers(code));
       // cognium-dev#293: the same strip, but living in a user-defined helper.
       additionalSanitizers.push(...findCrlfWrapperFunctionSanitizers(code, 'java'));
@@ -4140,9 +4146,12 @@ function findGoMapAllowlistGuardSanitizers(code: string): TaintSanitizer[] {
   const sanitizers: TaintSanitizer[] = [];
   const lines = code.split('\n');
 
-  // `if !<mapName>[<key>] {`  — optional whitespace, optional `_ ,`
-  // ignored. Captures the map identifier in group 1.
-  const guardOpen = /^\s*if\s+!\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*[A-Za-z_][A-Za-z0-9_]*\s*\]\s*\{/;
+  // `if !<mapName>[<key>] {`, or that negated lookup as one `||` disjunct
+  // (`if err != nil || !<mapName>[u.Host] {`, #293): the block runs when any
+  // disjunct holds, so falling past it proves the key is in the map. The key
+  // may be a selector (`u.Host`). Captures the map identifier in group 1.
+  const guardOpen =
+    /^\s*if\s+(?:[^{&|]+\|\|\s*)*!\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\s*\]\s*(?:\|\|[^{&]+)?\{/;
   // Allow-list naming heuristic.
   const allowlistName = /^(?:[A-Z][A-Z0-9_]+|.*?(allowed|accepted|whitelist|permitted|valid|approved).*)$/i;
 
@@ -4176,9 +4185,19 @@ function findGoMapAllowlistGuardSanitizers(code: string): TaintSanitizer[] {
     if (closeLine === -1 || !bodyHasTerminator) continue;
 
     // Emit per-line sanitizers for every line AFTER the guard's closing
-    // brace through end of file. `checkSanitized` is line-keyed so this
-    // suppresses the relevant sink types in the safe branch.
-    for (let l = closeLine + 2; l <= lines.length; l++) {
+    // brace to the end of the enclosing block (the function body, #293 —
+    // it used to run to the end of the file, crediting later functions).
+    // `checkSanitized` is line-keyed so this suppresses the relevant sink
+    // types in the safe branch.
+    let end = lines.length;
+    for (let j = closeLine + 1, d = 0; j < lines.length; j++) {
+      for (const ch of lines[j]) {
+        if (ch === '{') d++;
+        else if (ch === '}') d--;
+      }
+      if (d < 0) { end = j + 1; break; }
+    }
+    for (let l = closeLine + 2; l <= end; l++) {
       sanitizers.push({
         type: 'go_map_allowlist_guard',
         method: 'if',
@@ -6058,6 +6077,10 @@ function findJavaCanonicalPathStartsWithGuardSanitizers(code: string): TaintSani
     const m = guardRe.exec(lines[i]);
     if (!m) continue;
     if (!guardRejects(lines, i, terminatorRe, 6)) continue;
+    // cognium-dev#618: a string-prefix check against a canonical base with no
+    // trailing separator is the prefix-confusion bypass, not a guard.
+    const base = javaCallArgument(lines.slice(i).join('\n'), m.index + m[0].length - 1);
+    if (base !== null && javaCanonicalBaseLacksSeparator(lines, i, base)) continue;
 
     const guarded = new Set<string>([m[1]]);
     const mentions = (t: string): boolean => {
@@ -6168,6 +6191,176 @@ function guardRejects(
  * form `if (x.StartsWith(root)) { … }` still reports, and a test pins that so
  * the gap stays visible rather than silently assumed.
  */
+/**
+ * cognium-dev#293 (Java cell): membership in a literal allow-list followed by
+ * a reject is a guard.
+ *
+ *   if (!Set.of("locale", "theme").contains(key)) throw new IllegalArgumentException();
+ *   req.getSession().setAttribute(key, value);       // was trust_boundary on `key`
+ *
+ * Past the guard, `key` is one of the listed string constants. The set must
+ * be written out as string literals: inline `Set.of` / `List.of` /
+ * `Arrays.asList`, or a `static final` constant of the same file initialised
+ * from one of them. A set built any other way (a parameter, a config read, a
+ * mutable collection) is not credited: its contents are unknown.
+ *
+ * Only the guarded variable is credited, from the guard to the end of the
+ * enclosing method or the variable's next reassignment, and only when the
+ * guard rejects (`guardRejects`).
+ */
+const JAVA_OPERAND_KEYWORDS = new Set([
+  'new', 'return', 'this', 'super', 'null', 'true', 'false', 'throw', 'if', 'else', 'instanceof',
+  'int', 'long', 'short', 'byte', 'char', 'boolean', 'double', 'float', 'var', 'final',
+]);
+
+/**
+ * True when `expr` is only `name`, string literals, `.length()` / `.size()`,
+ * and `+` (no other locals or value-producing calls).
+ */
+function javaExprOnlyGuardedAndLits(expr: string, name: string): boolean {
+  let s = expr
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '')
+    .replace(/\.\s*(?:length|size)\s*\(\s*\)/g, '')
+    .replace(new RegExp(String.raw`\b${name}\b`, 'g'), '');
+  s = s.replace(/[+\s()]/g, '');
+  return s.length === 0;
+}
+
+/** Top-level comma-separated arguments of a call, respecting quotes and nesting. */
+function javaSplitCallArgs(argsText: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let quote: string | null = null;
+  let start = 0;
+  for (let i = 0; i < argsText.length; i++) {
+    const c = argsText[i]!;
+    if (quote) {
+      if (c === '\\') { i++; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ',' && depth === 0) {
+      out.push(argsText.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const last = argsText.slice(start).trim();
+  if (last || out.length > 0) out.push(last);
+  return out;
+}
+
+/**
+ * True when a call on `line` (other than length/size) has an argument that is
+ * not only string literals and the guarded variable — a raw operand.
+ */
+function javaCallHasRawArgument(line: string, name: string): boolean {
+  const re = /\b([A-Za-z_]\w*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(line)) !== null) {
+    const method = m[1]!;
+    if (method === 'length' || method === 'size') continue;
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let quote: string | null = null;
+    let end = -1;
+    for (let i = open; i < line.length; i++) {
+      const c = line[i]!;
+      if (quote) {
+        if (c === '\\') { i++; continue; }
+        if (c === quote) quote = null;
+        continue;
+      }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) { end = i; break; }
+      }
+    }
+    if (end < 0) continue;
+    for (const arg of javaSplitCallArgs(line.slice(open + 1, end))) {
+      if (!arg) continue;
+      if (!javaExprOnlyGuardedAndLits(arg, name)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when `line` reads a lower-case identifier other than `name` as a value
+ * (not a receiver, call name, member, type, constant or the assigned local),
+ * or a call whose argument is not only string literals / `name` (a call-shaped
+ * raw operand such as `req.getParameter("level")` beside the guarded local).
+ */
+function otherLocalOperand(line: string, name: string): boolean {
+  if (javaCallHasRawArgument(line, name)) return true;
+  const s = line
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""')
+    .replace(/^\s*(?:[\w<>[\],.?]+\s+)?[A-Za-z_]\w*\s*=(?!=)/, ' ')
+    .replace(/\.\s*[A-Za-z_]\w*/g, ' ')
+    .replace(/\b[A-Za-z_]\w*(?=\s*[.(])/g, ' ');
+  return (s.match(/\b[a-z_]\w*\b/g) ?? []).some(id => id !== name && !JAVA_OPERAND_KEYWORDS.has(id));
+}
+
+function findJavaLiteralAllowlistGuardSanitizers(code: string): TaintSanitizer[] {
+  const sanitizers: TaintSanitizer[] = [];
+  const lines = code.split('\n');
+  const literalList = String.raw`(?:Set|List)\s*\.\s*of|Arrays\s*\.\s*asList`;
+  const literalArgs = String.raw`\(\s*"(?:[^"\\]|\\.)*"(?:\s*,\s*"(?:[^"\\]|\\.)*")*\s*\)`;
+  // Constants declared from a literal list in this file.
+  const constants = new Set<string>();
+  const constRe = new RegExp(
+    String.raw`\bstatic\s+final\s+[\w<>,.\s]+?\s([A-Za-z_]\w*)\s*=\s*(?:${literalList})\s*${literalArgs}\s*;`,
+  );
+  for (const l of lines) {
+    const m = constRe.exec(l);
+    if (m) constants.add(m[1]!);
+  }
+  const guardRe = new RegExp(
+    String.raw`\bif\s*\(\s*!\s*(?:(?:${literalList})\s*${literalArgs}|([A-Za-z_]\w*))\s*\.\s*contains\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\)`,
+  );
+  const terminatorRe = /\b(throw|return)\b/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const m = guardRe.exec(lines[i]!);
+    if (!m) continue;
+    if (m[1] !== undefined && !constants.has(m[1])) continue;
+    if (!guardRejects(lines, i, terminatorRe, 6)) continue;
+    const name = m[2]!;
+    const mention = new RegExp(String.raw`(?<![\w.])${name}\b`);
+    const reassign = new RegExp(String.raw`^\s*(?:[\w.<>[\]]+\s+)?${name}\s*=(?!=)`);
+    // Skip the guard's own block, then credit to the end of the enclosing method.
+    let start = i + 1;
+    if (/\{\s*$/.test(lines[i]!)) {
+      for (let d = 0, j = i; j < lines.length; j++) {
+        for (const ch of lines[j]!) { if (ch === '{') d++; else if (ch === '}') d--; }
+        if (d <= 0) { start = j + 1; break; }
+      }
+    }
+    for (let j = start, d = 0; j < lines.length; j++) {
+      for (const ch of lines[j]!) { if (ch === '{') d++; else if (ch === '}') d--; }
+      if (d < 0) break;
+      if (reassign.test(lines[j]!)) break;
+      if (!mention.test(lines[j]!)) continue;
+      // The credit is line-keyed: a line that also carries another local
+      // (`"... n='" + who + "' ORDER BY " + col`) would clean `who` too.
+      if (otherLocalOperand(lines[j]!, name)) continue;
+      sanitizers.push({
+        type: 'java_literal_allowlist_guard',
+        method: 'guard',
+        line: j + 1,
+        sanitizes: ['trust_boundary', 'sql_injection', 'command_injection', 'path_traversal', 'ssrf',
+                    'ldap_injection', 'xpath_injection', 'log_injection', 'xss', 'open_redirect',
+                    'external_taint_escape'],
+      });
+    }
+  }
+  return sanitizers;
+}
+
 /**
  * cognium-dev#272 — a validating predicate followed by an EARLY RETURN is a
  * guard, and the value reaching the sink afterwards is already validated.

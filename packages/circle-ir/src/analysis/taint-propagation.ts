@@ -603,6 +603,12 @@ function maskSanitizerCalls(expr: string, refs: SanitizerCallRef[]): string {
   return out;
 }
 
+function maskLengthOf(expr: string): string {
+  return expr
+    .replace(/\b(?:len|strlen|count)\s*\(\s*[\w$.]+\s*\)/g, ' 0 ')
+    .replace(/[\w$.]+\s*\.\s*(?:length|size|count)\s*(?:\(\s*\))?(?![\w$(])/g, ' 0 ');
+}
+
 function blankStringLiterals(expr: string): string {
   return expr
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
@@ -631,15 +637,21 @@ export function identifierOutsideSanitizerCalls(
   );
   for (const call of calls) {
     if (refs.some(r => r.methodName === call.method_name)) continue;
-    for (const arg of call.arguments) {
+    // A same-line guard (`IsLocalUrl(next); Redirect(next)`) is not a
+    // partial wrap. Only a call with an argument that itself contains the
+    // sanitizer call can leave a raw operand: in that argument, or in a
+    // sibling argument of the same call (`Printf("%s %s", clean(a), b)`).
+    const masked = call.arguments.map(arg => {
       const expr = arg.expression ?? '';
-      if (!expr) continue;
-      // A same-line guard (`IsLocalUrl(next); Redirect(next)`) is not a
-      // partial wrap. Only an argument that itself contains the sanitizer
-      // call can leave a raw sibling operand.
-      const masked = maskSanitizerCalls(expr, refs);
-      if (masked === expr) continue;
-      if (re.test(blankStringLiterals(masked))) return true;
+      return { expr, masked: expr ? maskSanitizerCalls(expr, refs) : expr };
+    });
+    if (!masked.some(m => m.masked !== m.expr)) continue;
+    for (const m of masked) {
+      if (!m.masked) continue;
+      // A sibling that passes only the value's length (`len(s)`,
+      // `s.length()`, `s.size()`) carries no attacker-controlled text.
+      const text = m.masked === m.expr ? maskLengthOf(m.masked) : m.masked;
+      if (re.test(blankStringLiterals(text))) return true;
     }
   }
   return false;
