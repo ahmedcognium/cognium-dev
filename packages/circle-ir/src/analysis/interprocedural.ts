@@ -181,6 +181,10 @@ const CSHARP_NON_ESCAPE_METHODS = new Set([
   // claim needing its own change.
   'Add', 'AddLast', 'AddFirst', 'AddRange', 'TryAdd', 'Insert', 'Push',
   'Enqueue',
+  // Collection lookups (cognium-dev#665). Using a value as a key into an
+  // in-memory map hands nothing out of the program; it is the allowlist
+  // shape (`if (!Catalog.TryGetValue(sku, out var price)) return …`).
+  'TryGetValue', 'ContainsKey', 'ContainsValue', 'GetValueOrDefault',
   // Encoders (cognium-dev#518). Encoding a value hands back a string; nothing
   // has left the program at `Uri.EscapeDataString(input)`.
   'EscapeDataString', 'EscapeUriString', 'UrlEncode', 'UrlPathEncode',
@@ -192,6 +196,10 @@ function isCSharpNonEscapeCall(call: CallInfo): boolean {
   const recv = (call.receiver ?? '').split('.').pop() ?? '';
   if (CSHARP_PURE_STATIC_RECEIVERS.has(recv)) return true;
   if (CSHARP_NON_ESCAPE_METHODS.has(name)) return true;
+  // The inherited controller helper `Content(body, contentType)` writes the
+  // response body; the `Content` xss sink judges it by its content type
+  // (cognium-dev#580), so a plain-text or JSON body is not an escape either.
+  if (name === 'Content' && (call.receiver === null || call.receiver === 'this' || call.receiver === 'base')) return true;
   return false;
 }
 
