@@ -914,6 +914,43 @@ function csharpContentServesHtml(call: CallInfo): boolean {
 }
 
 /**
+ * True when an unqualified / `this.` / `base.` call to `Content` sits in a type
+ * that can inherit the MVC helper (cognium-dev#580). The C# extractor does not
+ * record base lists, so they are read from the declaration text.
+ *   - a base named `Controller`, `ControllerBase` or `PageModel`: the helper;
+ *   - a `partial` class: the base may be in another part, so treat as unknown and keep;
+ *   - no base list, or only `I`-prefixed interface names: nothing is inherited,
+ *     so `Content(...)` is the type's own method;
+ *   - any other base: unknown, kept, unless the type declares its own `Content`
+ *     name, which hides an inherited one.
+ * Non-class IR kinds (and a missing owner) keep the sink. A controller that
+ * declares its own `Content` overload keeps the helper call.
+ */
+function csharpContentCallInheritsHelper(
+  call: CallInfo,
+  types: CircleIR['types'],
+  sourceLines: string[],
+): boolean {
+  const line = call.location.line;
+  let owner: CircleIR['types'][number] | undefined;
+  for (const t of types) {
+    if (line < t.start_line || line > t.end_line) continue;
+    if (!owner || t.end_line - t.start_line < owner.end_line - owner.start_line) owner = t;
+  }
+  if (!owner || owner.kind !== 'class') return true;
+  const header = sourceLines.slice(owner.start_line - 1, owner.start_line + 4).join(' ');
+  const decl = new RegExp(`\\bclass\\s+${owner.name}\\b(?:\\s*<[^>]*>)?\\s*(?::\\s*([^{]*?))?\\s*(?:where\\b[^{]*)?\\{`).exec(header);
+  if (!decl) return true;
+  const bases = (decl[1] ?? '').split(',').map(b => b.trim().replace(/<.*$/, '').split('.').pop() ?? '').filter(Boolean);
+  if (bases.some(b => b === 'Controller' || b === 'ControllerBase' || b === 'PageModel')) return true;
+  // Partial types may declare their base in another part of the type — unknown, keep.
+  const classAt = header.search(/\bclass\b/);
+  if (classAt >= 0 && /\bpartial\b/.test(header.slice(0, classAt))) return true;
+  if (bases.every(b => /^I[A-Z]/.test(b))) return false;
+  return !owner.methods.some(m => m.name === 'Content');
+}
+
+/**
  * Compute, per sink type, the set of C# variables whose value has passed through
  * a sanitizer for that type (cognium-dev C#/.NET Phase-1). Seeds from
  * `V = <sanitizer_T>(…)` assignments, then takes a transitive closure over
@@ -2411,10 +2448,13 @@ export class SinkFilterPass implements AnalysisPass<SinkFilterResult> {
     // at least one `Content` call on its line is the controller helper with an
     // HTML or unknown content type.
     if (language === 'csharp') {
+      const csContentLines = ctx.code.split('\n');
       filtered = filtered.filter(sink => {
         if (sink.type !== 'xss' || sink.method !== 'Content') return true;
         const contentCalls = callsByLine.get(sink.line)?.filter(c => c.method_name === 'Content') ?? [];
-        return contentCalls.length === 0 || contentCalls.some(csharpContentServesHtml);
+        // The call must also sit in a type that can inherit the MVC helper (#580).
+        return contentCalls.length === 0 || contentCalls.some(c =>
+          csharpContentCallInheritsHelper(c, ctx.graph.ir.types, csContentLines) && csharpContentServesHtml(c));
       });
     }
 
