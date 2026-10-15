@@ -19,6 +19,7 @@ import type {
 import { CodeGraph } from '../graph/index.js';
 import { walkBackwardDefs } from './dfg-walk.js';
 import { sanitizerCoversSink } from './sanitizer-index.js';
+import { HTML_CONTEXT_ENCODER_METHODS, HTML_CONTEXT_ENCODER_UNCOVERED_SINKS } from './constant-propagation/patterns.js';
 
 /**
  * Optional context used by checkSanitized to widen its search from a single
@@ -47,6 +48,13 @@ export interface TaintedVariable {
   sourceType: string;
   sourceLine: number;
   confidence: number;
+  /**
+   * #589: set when the value passed through a context-specific HTML encoder
+   * (`escapeHtml`, `encodeForHTML`, …). It is clean for the output-encoding
+   * sinks but still reaches the listed sink types (`trust_boundary`), so only
+   * those sinks may report it.
+   */
+  survivesOnlyFor?: ReadonlySet<string>;
 }
 
 /**
@@ -118,7 +126,9 @@ export function propagateTaint(
   callsOrSources: CallInfo[] | TaintSource[],
   sourcesOrSinks: TaintSource[] | TaintSink[],
   sinksOrSanitizers: TaintSink[] | TaintSanitizer[],
-  sanitizersArg?: TaintSanitizer[]
+  sanitizersArg?: TaintSanitizer[],
+  /** Optional source text — used when DFG defs lack `expression` (Java locals). */
+  sourceCode?: string,
 ): TaintPropagationResult {
   let graph: CodeGraph;
   let sources: TaintSource[];
@@ -193,19 +203,30 @@ export function propagateTaint(
   taintedVars.push(...initialTaint);
 
   // Step 2: Propagate taint through def-use chains
+  const sourceLines = typeof sourceCode === 'string' ? sourceCode.split('\n') : [];
+  const lineText = (line: number): string | undefined => {
+    const raw = sourceLines[line - 1];
+    return raw !== undefined ? raw : undefined;
+  };
+
   const propagatedTaint = propagateThroughChains(
     initialTaint,
     graph.chainsByFromDef,
     defById,
     sanitizersByLine,
-    graph.taintBarrierDefIds
+    graph.taintBarrierDefIds,
+    lineText,
   );
-  taintedVars.push(...propagatedTaint);
+  // #589: variables that survived only an HTML-encoder hop (`survivesOnlyFor`)
+  // are not general taint, so they stay out of the reported `taintedVars`; they
+  // still seed the sink check below, which lets them reach only the sink types
+  // the encoder does not clean (`trust_boundary`).
+  taintedVars.push(...propagatedTaint.filter(tv => !tv.survivesOnlyFor));
 
   // Combine all tainted definitions
   const allTaintedDefIds = new Set<number>();
   const taintByDefId = new Map<number, TaintedVariable>();
-  for (const tv of taintedVars) {
+  for (const tv of [...taintedVars, ...propagatedTaint.filter(tv => tv.survivesOnlyFor)]) {
     allTaintedDefIds.add(tv.defId);
     if (!yieldsToRealSource(taintByDefId.get(tv.defId), tv)) taintByDefId.set(tv.defId, tv);
   }
@@ -261,6 +282,9 @@ export function propagateTaint(
                   if (!re.test(arg.expression)) continue;
                 }
                 const taintInfo = taintByDefId.get(use.def_id);
+                // #589: taint that survived only an HTML-encoder hop is clean for
+                // every sink type except the ones it still reaches.
+                if (taintInfo?.survivesOnlyFor && !taintInfo.survivesOnlyFor.has(sink.type)) continue;
                 if (taintInfo) {
                   // Check if sanitized.
                   //
@@ -521,6 +545,33 @@ function findInitialTaint(
 }
 
 /**
+ * #589: true when `variable` still appears in a def expression after HTML-encoder
+ * calls are masked — e.g. `escapeHtml(a) + b` keeps `b` as a raw operand.
+ */
+function identifierOutsideHtmlEncoderCalls(
+  variable: string,
+  expression: string | undefined,
+  sans: TaintSanitizer[] | undefined,
+): boolean {
+  if (!expression || !sans || sans.length === 0) return false;
+  if (!/^[A-Za-z_$][\w$]*$/.test(variable)) return false;
+  const refs: SanitizerCallRef[] = [];
+  for (const san of sans) {
+    if (!isHtmlContextEncoder(san)) continue;
+    const m = /(?:(\w+)\.)?(\w+)\(\)/.exec(san.method);
+    if (!m?.[2]) continue;
+    refs.push({ receiver: m[1], methodName: m[2] });
+  }
+  if (refs.length === 0) return false;
+  const masked = maskSanitizerCalls(expression, refs);
+  if (masked === expression) return false;
+  const re = new RegExp(
+    `(?:^|[^A-Za-z0-9_$])${variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[^A-Za-z0-9_$]|$)`,
+  );
+  return re.test(blankStringLiterals(masked));
+}
+
+/**
  * True when `next` is a bare-parameter seed and `existing` already credits the
  * same definition to a real source: the real source keeps the definition.
  */
@@ -540,7 +591,8 @@ function propagateThroughChains(
   chainsByFromDef: Map<number, DFGChain[]>,
   defById: Map<number, DFGDef>,
   sanitizersByLine: Map<number, TaintSanitizer[]>,
-  taintBarrierDefIds: ReadonlySet<number>
+  taintBarrierDefIds: ReadonlySet<number>,
+  lineText?: (line: number) => string | undefined,
 ): TaintedVariable[] {
   const propagated: TaintedVariable[] = [];
   const taintedDefIds = new Set<number>(initialTaint.map(t => t.defId));
@@ -562,7 +614,6 @@ function propagateThroughChains(
     const outgoingChains = chainsByFromDef.get(currentDefId) ?? [];
 
     for (const chain of outgoingChains) {
-      if (visited.has(chain.to_def)) continue;
       // A measure/test of the value or a constant-table lookup (#568, #667).
       if (taintBarrierDefIds.has(chain.to_def)) continue;
 
@@ -577,7 +628,21 @@ function propagateThroughChains(
         sanitizersByLine
       );
 
-      if (!sanitizeCheck.sanitized) {
+      const sansAtTarget = sanitizersByLine.get(targetDef.line);
+      // #589: decide encoder-only per operand, not per line. A raw sibling on
+      // `escapeHtml(a) + b` is unrestricted even though the line has an encoder.
+      const viaName = chain.via || currentTaint.variable;
+      const rawOperand = identifierOutsideHtmlEncoderCalls(
+        viaName,
+        targetDef.expression ?? lineText?.(targetDef.line),
+        sansAtTarget,
+      );
+      const effectivelySanitized = sanitizeCheck.sanitized && !rawOperand;
+      // #589: a hop through a context-specific HTML encoder keeps the taint
+      // alive for the sink types the encoder does not clean (`trust_boundary`).
+      const encoderOnly = effectivelySanitized && sanitizersAreHtmlContextEncoders(sansAtTarget);
+
+      if (!effectivelySanitized || encoderOnly) {
         const newTaint: TaintedVariable = {
           variable: targetDef.variable,
           defId: targetDef.id,
@@ -585,7 +650,25 @@ function propagateThroughChains(
           sourceType: currentTaint.sourceType,
           sourceLine: currentTaint.sourceLine,
           confidence: currentTaint.confidence * 0.95, // Decay confidence slightly
+          ...(encoderOnly
+            ? { survivesOnlyFor: HTML_CONTEXT_ENCODER_UNCOVERED_SINKS }
+            : currentTaint.survivesOnlyFor ? { survivesOnlyFor: currentTaint.survivesOnlyFor } : {}),
         };
+
+        const existing = taintInfoByDefId.get(targetDef.id);
+        if (visited.has(chain.to_def)) {
+          // #589: first-wins `visited` kept an encoder-only predecessor; a later
+          // unrestricted chain must replace it and keep propagating.
+          if (!existing?.survivesOnlyFor) continue;
+          if (newTaint.survivesOnlyFor) continue;
+          const idx = propagated.findIndex(t => t.defId === targetDef.id);
+          if (idx >= 0) propagated[idx] = newTaint;
+          else propagated.push(newTaint);
+          taintedDefIds.add(targetDef.id);
+          taintInfoByDefId.set(targetDef.id, newTaint);
+          queue.push(targetDef.id);
+          continue;
+        }
 
         propagated.push(newTaint);
         taintedDefIds.add(targetDef.id);
@@ -745,6 +828,46 @@ export function identifierOutsideSanitizerCalls(
   return false;
 }
 
+/**
+ * True when `variable` appears in `text` once covering sanitizer calls are
+ * removed. Returns `null` when no covering sanitizer call is found in `text`
+ * (the caller cannot tell a wrapped operand from a raw one).
+ *
+ * #589: `mixed = escapeHtml(a) + b` keeps `b`; `both = escapeHtml(a) +
+ * escapeHtml(b)` keeps nothing.
+ */
+export function identifierOutsideSanitizerCallsInText(
+  variable: string,
+  text: string,
+  sanitizers: TaintSanitizer[],
+  sinkType: string,
+): boolean | null {
+  const refs = sanitizerCallRefs(sanitizers, sinkType);
+  if (refs.length === 0) return null;
+  const masked = maskSanitizerCalls(text, refs);
+  if (masked === text) return null;
+  if (!/^[A-Za-z_$][\w$]*$/.test(variable)) return true;
+  const re = new RegExp(
+    `(?:^|[^A-Za-z0-9_$])${variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[^A-Za-z0-9_$]|$)`,
+  );
+  return re.test(blankStringLiterals(masked));
+}
+
+/** Last segment of a sanitizer's method name, without the call parens (`ESAPI.encoder().encodeForHTML()` -> `encodeForHTML`). */
+function sanitizerMethodTail(san: TaintSanitizer): string {
+  const m = san.method ?? '';
+  return m.replace(/\(\)$/, '').split('.').pop() ?? '';
+}
+
+/** #589: a method-call sanitizer that is a context-specific HTML / markup encoder. */
+function isHtmlContextEncoder(san: TaintSanitizer): boolean {
+  return san.type === 'method_call' && HTML_CONTEXT_ENCODER_METHODS.has(sanitizerMethodTail(san));
+}
+
+function sanitizersAreHtmlContextEncoders(sans: TaintSanitizer[] | undefined): boolean {
+  return !!sans && sans.length > 0 && sans.every(isHtmlContextEncoder);
+}
+
 function checkSanitized(
   fromLine: number,
   toLine: number,
@@ -760,6 +883,8 @@ function checkSanitized(
   const sanitizersAtTarget = sanitizersByLine.get(toLine);
   if (sanitizersAtTarget && sanitizersAtTarget.length > 0) {
     for (const san of sanitizersAtTarget) {
+      // #589: an HTML-context encoder does not clean a `trust_boundary` sink.
+      if (HTML_CONTEXT_ENCODER_UNCOVERED_SINKS.has(sinkType) && isHtmlContextEncoder(san)) continue;
       if (isKnownSinkType) {
         // H8 (#254 3.171.0): Set-backed lookup — O(1) after first call.
         if (sanitizerCoversSink(san, sinkType)) {
@@ -798,6 +923,7 @@ function checkSanitized(
       const sansAtLine = sanitizersByLine.get(line);
       if (!sansAtLine || sansAtLine.length === 0) continue;
       for (const san of sansAtLine) {
+        if (HTML_CONTEXT_ENCODER_UNCOVERED_SINKS.has(sinkType) && isHtmlContextEncoder(san)) continue;
         if (isKnownSinkType) {
           // H8 (#254 3.171.0): Set-backed lookup — O(1) after first call.
           if (sanitizerCoversSink(san, sinkType)) {

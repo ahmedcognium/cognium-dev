@@ -801,8 +801,10 @@ function jsSsrfHostGuardedLines(code: string): Set<number> {
 }
 
 /**
- * Is this `plugin_param` source a map read of a key that was never written, on
- * a map whose entire contents we can see? (cognium-dev#328 prerequisite.)
+ * Is this `plugin_param` source a map read that provably yields `null` or a
+ * string literal — a key that was never written, or any key of a literal-only
+ * map (#584) — on a map whose entire contents we can see? (cognium-dev#328
+ * prerequisite.)
  *
  * Sound only when the map's provenance is fully known, so all three hold:
  *
@@ -813,10 +815,11 @@ function jsSsrfHostGuardedLines(code: string): Set<number> {
  *  (b) the receiver never escapes — it is not passed as an argument to any
  *      call. `helper(m)` could `put` into it out of sight, so once it escapes
  *      the contents are no longer knowable from this file.
- *  (c) the read key is a string literal with **no** `put` of that same literal
- *      anywhere in the file. A matching `put` keeps the source regardless of
- *      whether the stored value looks tainted — this gate only removes reads
- *      that provably yield `null`, never reads whose value it judged clean.
+ *  (c) the read key is a string literal. A matching `put` of that literal no
+ *      longer keeps the source automatically: when every put value is itself a
+ *      string literal (`isLiteralOnlyLocalMap`), the read is still dropped as
+ *      non-tainted (#584). This gate only removes reads that provably yield
+ *      `null` or a literal-only local map, never reads whose value is uncertain.
  *
  * Deliberately narrow: `plugin_param` only, literal keys only, and any
  * uncertainty leaves the source untouched. Non-literal keys (`m.get(k)`) are
@@ -849,11 +852,40 @@ function isUnwrittenLocalMapKeyRead(code: string, source: TaintSource): boolean 
     if (escapeRe.test(stripped)) return false;
   }
 
-  // (c2) was this literal key ever written?
+  // (c2) was this literal key ever written? If so, drop only a literal-only map.
   const putRe = new RegExp(`\\b${recv}\\s*\\.\\s*put\\s*\\(\\s*"${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`);
-  if (lines.some(l => putRe.test(l))) return false;
+  if (lines.some(l => putRe.test(l))) return isLiteralOnlyLocalMap(lines, recv);
 
   return true;
+}
+
+/**
+ * cognium-dev#584 (slice) — the map's whole contents are string literals.
+ *
+ * Every mutation of `recv` in the file is a `put(<key>, "<string literal>")`:
+ * no `put` of a non-literal value under any key (so no key-shuffle can place a
+ * tainted value under the key being read), and no bulk or computing mutator
+ * (`putAll`, `putIfAbsent`, `compute*`, `merge`, `replace*`) that could store
+ * a value out of sight. Combined with (a) local construction and (b) no escape
+ * in the caller, a read of such a map yields a literal and is not a source.
+ */
+function isLiteralOnlyLocalMap(lines: string[], recv: string): boolean {
+  const anyPut = new RegExp(`\\b${recv}\\s*\\.\\s*put\\s*\\(`, 'g');
+  const literalPut = new RegExp(
+    `\\b${recv}\\s*\\.\\s*put\\s*\\(\\s*(?:"(?:[^"\\\\]|\\\\.)*"|[A-Za-z_][\\w.]*)\\s*,\\s*"(?:[^"\\\\]|\\\\.)*"\\s*\\)`,
+    'g',
+  );
+  const otherMutator = new RegExp(
+    `\\b${recv}\\s*\\.\\s*(?:putAll|putIfAbsent|compute|computeIfAbsent|computeIfPresent|merge|replace|replaceAll|entrySet|values)\\s*\\(`,
+  );
+  let puts = 0;
+  let literalPuts = 0;
+  for (const l of lines) {
+    if (otherMutator.test(l)) return false;
+    puts += (l.match(anyPut) ?? []).length;
+    literalPuts += (l.match(literalPut) ?? []).length;
+  }
+  return puts > 0 && puts === literalPuts;
 }
 
 
@@ -1265,7 +1297,9 @@ export class SinkFilterPass implements AnalysisPass<SinkFilterResult> {
     // That is SecuriBench Micro `Collections6:47`, an `/* OK */` line. The
     // false positive is currently masked by the const-prop veto in #328, so
     // this gate is behaviour-neutral today; its purpose is to make lifting that
-    // veto safe, which is the sequencing chosen on #328.
+    // veto safe, which is the sequencing chosen on #328. #584 widened it: a read
+    // of a key that WAS put is also dropped when every value put on that local,
+    // non-escaping map is a string literal (`isLiteralOnlyLocalMap`).
     const sources: TaintSource[] = ctx.code
       ? executableSources.filter(s => !isUnwrittenLocalMapKeyRead(ctx.code as string, s))
       : executableSources;
@@ -1292,6 +1326,7 @@ export class SinkFilterPass implements AnalysisPass<SinkFilterResult> {
     filtered = filterCleanVariableSinks(
       filtered, calls, constProp.tainted, constProp.symbols,
       dfg, constProp.sanitizedVars, constProp.synchronizedLines, language,
+      constProp.sanitizedVarUncovered,
     );
 
     // Stage 4 — sanitized sinks. A sanitizer on one operand does not drop
@@ -3080,6 +3115,7 @@ export function filterCleanVariableSinks(
   sanitizedVars?: Set<string>,
   synchronizedLines?: Set<number>,
   language?: string,
+  sanitizedVarUncovered?: Map<string, ReadonlySet<string>>,
 ): CircleIR['taint']['sinks'] {
   const fieldNames = new Set<string>();
   if (dfg) {
@@ -3149,7 +3185,28 @@ export function filterCleanVariableSinks(
             const scopedName = methodName ? `${methodName}:${varName}` : varName;
 
             if (fieldNames.has(varName) && !isInSynchronizedBlock) { argClean = false; break; }
-            if (sanitizedVars?.has(scopedName) || sanitizedVars?.has(varName)) continue;
+            // #589 review: when any `method:var` sanitizer exists, decide from
+            // the scoped name only — do not treat a sibling method's encoder
+            // (or its unscoped alias) as sanitizing this method's local.
+            const suffix = `:${varName}`;
+            let hasScopedSanitizer = false;
+            if (sanitizedVars) {
+              for (const s of sanitizedVars) {
+                if (s !== varName && s.endsWith(suffix)) { hasScopedSanitizer = true; break; }
+              }
+            }
+            const isSanitizedHere = sanitizedVars?.has(scopedName)
+              || (!hasScopedSanitizer && !!sanitizedVars?.has(varName));
+            if (isSanitizedHere) {
+              // #589: a context-specific encoder (`escapeHtml`, `encodeForHTML`, …)
+              // does not clean `trust_boundary`; that sink on the same
+              // variable stays.
+              const uncovered = hasScopedSanitizer
+                ? sanitizedVarUncovered?.get(scopedName)
+                : (sanitizedVarUncovered?.get(scopedName) ?? sanitizedVarUncovered?.get(varName));
+              if (!uncovered || !uncovered.has(sink.type)) continue;
+              argClean = false; break;
+            }
             if (taintedVars.has(scopedName) || taintedVars.has(varName)) { argClean = false; break; }
 
             const symbolValue = symbols.get(scopedName) ?? symbols.get(varName);

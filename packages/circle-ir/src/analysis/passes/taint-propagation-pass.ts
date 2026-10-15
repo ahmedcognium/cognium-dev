@@ -17,12 +17,13 @@ import type { AnalysisPass, PassContext } from '../../graph/analysis-pass.js';
 import type { ConstantPropagatorResult } from './constant-propagation-pass.js';
 import type { SinkFilterResult } from './sink-filter-pass.js';
 import { findJavaSpringReturnXSSSinks } from './language-sources-pass.js';
-import { identifierOutsideSanitizerCalls, propagateTaint } from '../taint-propagation.js';
+import { identifierOutsideSanitizerCalls, identifierOutsideSanitizerCallsInText, propagateTaint } from '../taint-propagation.js';
 import { isFalsePositive, isCorrelatedPredicateFP } from '../constant-propagation.js';
 import { buildJavaTaintedVars, buildPythonTaintedVars, buildRustTaintedVars, findPythonTrustBoundaryViolations, findPythonReturnXSSSinks, findJavaWikiPluginReturnXSSSinks } from './language-sources-pass.js';
 import { canSourceReachSink, sourceSemanticsAllowed } from '../findings.js';
 import { walkBackwardDefs } from '../dfg-walk.js';
 import { sanitizerCoversSink } from '../sanitizer-index.js';
+import { HTML_CONTEXT_ENCODER_METHODS } from '../constant-propagation/patterns.js';
 import { javaCanonicalStartsWithAllBare } from '../java-canonical-prefix.js';
 
 export interface TaintPropagationPassResult {
@@ -54,6 +55,87 @@ export interface TaintPropagationPassResult {
  */
 const CONTAINER_READ_SOURCES: ReadonlySet<string> = new Set(['plugin_param', 'config_param']);
 
+/** Method name enclosing `line`, from IR type ranges; null when unknown. */
+function methodAtLine(graph: PassContext['graph'], line: number): string | null {
+  for (const t of graph.ir.types ?? []) {
+    for (const m of t.methods) {
+      if (line >= m.start_line && line <= m.end_line) return m.name;
+    }
+  }
+  return null;
+}
+
+
+/** #589: method-call sanitizer that is a context-specific HTML / markup encoder. */
+function isHtmlContextEncoderSanitizer(san: { type?: string; method?: string }): boolean {
+  if (san.type !== 'method_call' || !san.method) return false;
+  const tail = san.method.replace(/\(\)$/, '').split('.').pop() ?? '';
+  return HTML_CONTEXT_ENCODER_METHODS.has(tail);
+}
+
+/**
+ * #589: true when some def-use chain from `startDefId` back to the flow's
+ * source reaches it without passing through a def that a covering sanitizer
+ * cleans. A def is covered when a sanitizer for `sinkType` sits on its line
+ * (at or after the source line) and none of its predecessor variables
+ * appears on that line outside the sanitizer call. Every def on the walk is
+ * tested, so a join one or more assignments before the sink is still seen.
+ * Unknown defs, chains that reach the source line raw, chains that end in a
+ * def with no predecessor, and an exhausted budget all count as uncovered.
+ */
+function hasUncoveredChain(
+  startDefId: number,
+  sinkType: string,
+  sourceLine: number,
+  graph: PassContext['graph'],
+  sanitizersByLine: Map<number, NonNullable<SinkFilterResult['sanitizers']>>,
+  codeLines: string[] | undefined,
+): boolean {
+  const visited = new Set<number>();
+  let budget = 256;
+  const covered = (defId: number, line: number): boolean => {
+    if (line < sourceLine) return false;
+    const sans = (sanitizersByLine.get(line) ?? []).filter(s => sanitizerCoversSink(s, sinkType));
+    if (sans.length === 0) return false;
+    const preds = graph.chainsByToDef.get(defId) ?? [];
+    if (preds.length === 0) return true;
+    const def = graph.defById.get(defId);
+    const text = codeLines?.[line - 1];
+    let rhs = text;
+    if (text && def) {
+      const v = def.variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const m = new RegExp(`(?:^|[^\\w$.])${v}\\s*=(?!=)`).exec(text);
+      if (m) rhs = text.slice(m.index + m[0].length);
+    }
+    for (const chain of preds) {
+      const predVar = graph.defById.get(chain.from_def)?.variable ?? chain.via;
+      const outside = rhs ? identifierOutsideSanitizerCallsInText(predVar, rhs, sans, sinkType) : null;
+      // No sanitizer call found in the text: fall back to the single-chain
+      // credit (one predecessor that the sanitizer line consumes).
+      if (outside === null) {
+        if (preds.length > 1) return false;
+        continue;
+      }
+      if (outside) return false;
+    }
+    return true;
+  };
+  const stack: number[] = [startDefId];
+  while (stack.length > 0) {
+    if (--budget < 0) return true;
+    const id = stack.pop() as number;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    const def = graph.defById.get(id);
+    if (!def) return true;
+    if (covered(id, def.line)) continue;
+    if (def.line <= sourceLine) return true;
+    const preds = graph.chainsByToDef.get(id) ?? [];
+    if (preds.length === 0) return true;
+    for (const chain of preds) stack.push(chain.from_def);
+  }
+  return false;
+}
 
 /**
  * #515 — find the real source a Python derived variable actually references.
@@ -213,7 +295,7 @@ function makeConstPropVeto(
   sources: SinkFilterResult['sources'],
   code: string | undefined,
   language?: string,
-): (step: { variable: string; line: number }, sourceLine: number, sinkLine: number) => boolean {
+): (step: { variable: string; line: number }, sourceLine: number, sinkLine: number, sinkType?: string) => boolean {
   const lines = typeof code === 'string' ? code.split('\n') : [];
   const selfReassign = new Map<string, number[]>();
   const escape = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -241,10 +323,29 @@ function makeConstPropVeto(
     const use = (graph.usesByLine.get(line) ?? []).find(u => u.variable === v && u.def_id != null);
     return use ? graph.defById.get(use.def_id!) : undefined;
   };
-  return (step, sourceLine, sinkLine) => {
+  return (step, sourceLine, sinkLine, sinkType) => {
     const r = isFalsePositive(constProp, step.line, step.variable);
     if (!r.isFalsePositive) return false;
     if (r.reason !== 'variable_not_tainted') return true;
+    // #589: the step variable came from a context-specific encoder
+    // (`escapeHtml`, `encodeForHTML`, …), which does not clean `trust_boundary`
+    // (a `session.setAttribute` sink). It is "not tainted" only for the other
+    // sink types, so this flow is not vetoed.
+    // Uncovered entries are scoped (`method:var`). A bare `step.variable` looks
+    // up only that step's own method — never any sibling `*:name`.
+    if (sinkType !== undefined && constProp.sanitizedVarUncovered) {
+      const unc = constProp.sanitizedVarUncovered;
+      if (step.variable.includes(':')) {
+        if (unc.get(step.variable)?.has(sinkType)) return false;
+      } else {
+        const method = methodAtLine(graph, step.line);
+        if (method) {
+          if (unc.get(`${method}:${step.variable}`)?.has(sinkType)) return false;
+        } else if (unc.get(step.variable)?.has(sinkType)) {
+          return false;
+        }
+      }
+    }
     // cognium-dev#579: const-prop has no C# source model, so its tainted set is
     // empty for C# and "not tainted" there means "never looked", not "clean".
     // It still records a plain reassignment (`s = q;`) as a tracked symbol,
@@ -301,7 +402,7 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
     }
 
     // DFG-based taint propagation
-    const propagationResult = propagateTaint(graph, sources, sinks, sanitizers);
+    const propagationResult = propagateTaint(graph, sources, sinks, sanitizers, undefined, ctx.code);
 
     // cognium-dev#328 — scoped exemption from const-prop's `variable_not_tainted`
     // veto for self-derived reassignment (`x = f(x)`, `x += y`), the #287 shape.
@@ -312,7 +413,7 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
       if (constProp.unreachableLines.has(flow.sink.line)) return false;
 
       for (const step of flow.path) {
-        if (isVetoed(step, flow.source.line, flow.sink.line)) return false;
+        if (isVetoed(step, flow.source.line, flow.sink.line, flow.sink.type)) return false;
       }
 
       if (isCorrelatedPredicateFP(constProp, flow)) return false;
@@ -626,15 +727,39 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
     // explicitly marked sanitized by a guard (e.g. regex-allowlist).
     // Applied to ALL flow generators (DFG-built and the four supplements)
     // so the suppression is uniform regardless of which path emitted the flow.
+    //
+    // #589: a variable produced by a context-specific encoder (`escapeHtml`,
+    // `encodeForHTML`, …) is not clean for `trust_boundary`
+    // (`session.setAttribute`), so that flow from the variable stays.
     const sanitizedNames = constProp.sanitizedVars;
+    const sanitizedUncovered = constProp.sanitizedVarUncovered;
     let finalFlows = sanitizedNames.size === 0 ? flows : flows.filter(f => {
       if (f.path.length === 0) return true;
       const sourceVar = f.path[0].variable;
       if (!sourceVar) return true;
-      if (sanitizedNames.has(sourceVar)) return false;
+      const coversFlow = (name: string): boolean => {
+        return !(sanitizedUncovered?.get(name)?.has(f.sink_type));
+      };
+      // #589 review: when any `method:var` sanitizer exists, only that flow's
+      // own method can drop it — never a sibling's scoped name (one encoder in
+      // doPost must not clear xss in other()), and never the bare alias alone.
+      const suffix = `:${sourceVar}`;
+      let hasScopedSanitizer = false;
       for (const s of sanitizedNames) {
-        if (s.endsWith(`:${sourceVar}`)) return false;
+        if (s !== sourceVar && s.endsWith(suffix)) { hasScopedSanitizer = true; break; }
       }
+      if (hasScopedSanitizer) {
+        if (sourceVar.includes(':') && sanitizedNames.has(sourceVar) && coversFlow(sourceVar)) return false;
+        const method = methodAtLine(graph, f.sink_line) ?? methodAtLine(graph, f.source_line);
+        if (method) {
+          const scoped = `${method}:${sourceVar}`;
+          if (sanitizedNames.has(scoped) && coversFlow(scoped)) return false;
+        }
+        // Scoped sanitizers exist for this name, but none proved to be this
+        // flow's method — keep the flow.
+        return true;
+      }
+      if (sanitizedNames.has(sourceVar) && coversFlow(sourceVar)) return false;
       return true;
     });
 
@@ -655,6 +780,7 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
         arr.push(san);
         sanitizersByLine.set(san.line, arr);
       }
+      const codeLines = typeof ctx.code === 'string' ? ctx.code.split('\n') : undefined;
       // True unless every def at `line` among `visited` is provably off this
       // flow: not a variable on its path, and a complete backward walk from it
       // never reaches `sourceLine`.
@@ -731,11 +857,28 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
           ? f.path[f.path.length - 1].variable
           : undefined;
         if (!sinkVar) return true;
+        // #589: an HTML encoder is credited only when every chain from the
+        // sink back to this flow's source passes through a covering
+        // sanitizer. Computed once per flow, over every reaching def of the
+        // sink variable, and only when an HTML encoder is the candidate.
+        let everyChainCovered: boolean | undefined;
+        const htmlEncoderCoversEveryChain = (): boolean => {
+          if (everyChainCovered === undefined) {
+            const starts: number[] = [];
+            for (const u of usesAtSink) {
+              if (u.variable === sinkVar && u.def_id !== null && u.def_id !== undefined) starts.push(u.def_id);
+            }
+            everyChainCovered = starts.length > 0 && starts.every(id =>
+              !hasUncoveredChain(id, f.sink_type, f.source_line, graph, sanitizersByLine, codeLines));
+          }
+          return everyChainCovered;
+        };
         for (const use of usesAtSink) {
           if (use.variable !== sinkVar) continue;
           if (use.def_id === null || use.def_id === undefined) continue;
+          const sinkDefId = use.def_id;
           const walk = walkBackwardDefs(
-            use.def_id,
+            sinkDefId,
             graph.chainsByToDef,
             graph.defById,
             { maxHops: 32 }
@@ -761,9 +904,12 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
             // sanitized def that does not derive from this flow's source.
             if (line > f.source_line && !sanitizedDefOnFlow(walk.visited, line, f)) continue;
             for (const san of sansAtLine) {
-              if (sanitizerCoversSink(san, f.sink_type)) {
-                return false;
-              }
+              if (!sanitizerCoversSink(san, f.sink_type)) continue;
+              // #589: a join anywhere between the sink and the encoder
+              // (`mixed = shown + b`, then `copy = mixed`) must not let an
+              // encoder on one operand drop unrestricted taint from another.
+              if (isHtmlContextEncoderSanitizer(san) && !htmlEncoderCoversEveryChain()) continue;
+              return false;
             }
           }
         }
@@ -1219,6 +1365,120 @@ function detectGoPackageGlobalFlows(
   return flows;
 }
 
+/**
+ * #614 — is `varName` tainted in the sink's own method?
+ *
+ * The const-prop result carries scoped names (`method:var`) and, for backward
+ * compatibility, an unscoped alias of each. The unscoped alias says only that
+ * SOME method tainted a local of that name. When any scoped entry for the name
+ * exists, membership is decided by the sink's own scoped name, so a same-named
+ * local in a safe sibling method (the Juliet `bad()` / `good*()` layout) is not
+ * treated as tainted. A name with no scoped entry (a field, a parameter) keeps
+ * the unscoped match. A field use (`this.name` / bare field read) is shared by
+ * every method of its class (SecuriBench Inter4); a local that merely shares a
+ * field's name is not.
+ */
+
+/**
+ * True when `methodName` declares a local (or param) named `varName`. With
+ * overloads, the declaration that encloses `atLine` is the one checked (the
+ * first declaration of that name is only a fallback when no line is known or
+ * none encloses it).
+ */
+function methodHasLocalDecl(
+  code: string | undefined,
+  methodName: string | null | undefined,
+  varName: string,
+  atLine?: number,
+): boolean {
+  if (!code || !methodName) return false;
+  // Find `methodName(...) [throws ...] {` then scan the body for a local decl.
+  const esc = methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const v = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const methodRe = new RegExp(
+    '(?:^|[\\s;{}])' + esc + '\\s*\\([^;{]*\\)\\s*(?:throws\\s+[^{]+)?\\{',
+    'gm',
+  );
+  const lineAt = (offset: number): number => {
+    let n = 1;
+    for (let k = 0; k < offset; k++) if (code.charCodeAt(k) === 10) n++;
+    return n;
+  };
+  type MethodSpan = { header: string; bodyStart: number; bodyEnd: number };
+  let chosen: MethodSpan | null = null;
+  let first: MethodSpan | null = null;
+  for (let m = methodRe.exec(code); m; m = methodRe.exec(code)) {
+    const bodyStart = m.index + m[0].length;
+    let i = bodyStart;
+    let depth = 1;
+    while (i < code.length && depth > 0) {
+      const c = code[i++];
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+    }
+    const cand: MethodSpan = { header: m[0], bodyStart, bodyEnd: i - 1 };
+    if (!first) first = cand;
+    if (atLine === undefined) break;
+    if (atLine >= lineAt(m.index) && atLine <= lineAt(cand.bodyEnd)) { chosen = cand; break; }
+  }
+  const hit = chosen ?? first;
+  if (!hit) return false;
+  const body = code.slice(hit.bodyStart, hit.bodyEnd);
+  // Parameter named varName counts as shadowing the field.
+  if (new RegExp('[(,]\\s*(?:final\\s+)?[\\w.<>,\\[\\]\\s]+\\s+' + v + '\\s*[,)]').test(hit.header)) return true;
+  const declRe = new RegExp(
+    '(?:^|[;{}])\\s*(?:(?:final|volatile)\\s+)?(?:[A-Za-z_][\\w.<>,\\[\\]\\s]*?)\\s+' + v + '\\s*(?:=|;|,)',
+    'm',
+  );
+  return declRe.test(body);
+}
+
+/**
+ * True when `expression` reads this class's own field `varName`: `this.name`,
+ * `self.name`, or `Enclosing.name` (static access through an enclosing type).
+ * Another object's member (`item.name`, `file.name`) is not this class's field.
+ */
+function isFieldUseExpression(
+  expression: string | undefined,
+  varName: string,
+  enclosingTypeNames: ReadonlySet<string>,
+): boolean {
+  if (!expression) return false;
+  const e = expression.trim();
+  if (e === `this.${varName}` || e === `self.${varName}`) return true;
+  const m = new RegExp('^([A-Za-z_]\\w*)\\.' + varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$').exec(e);
+  return !!m && enclosingTypeNames.has(m[1]);
+}
+
+/** Names of the types whose range encloses `line` (outer and nested). */
+function enclosingTypeNamesAt(types: CircleIR['types'] | undefined, line: number): Set<string> {
+  const names = new Set<string>();
+  for (const t of types ?? []) {
+    if (line >= t.start_line && line <= t.end_line) names.add(t.name);
+  }
+  return names;
+}
+
+
+function isTaintedInMethod(
+  taintedVars: ReadonlySet<string>,
+  varName: string,
+  scopedName: string,
+  fieldNames: ReadonlySet<string>,
+  isFieldUse: boolean,
+): boolean {
+  if (taintedVars.has(scopedName)) return true;
+  if (!taintedVars.has(varName)) return false;
+  if (scopedName === varName) return true;
+  // Field exception only when THIS use is a field, not when any field has the name.
+  if (isFieldUse && fieldNames.has(varName)) return true;
+  const suffix = `:${varName}`;
+  for (const t of taintedVars) {
+    if (t.endsWith(suffix)) return false;
+  }
+  return true;
+}
+
 function detectCollectionFlows(
   calls: CircleIR['calls'],
   sources: CircleIR['taint']['sources'],
@@ -1229,6 +1489,8 @@ function detectCollectionFlows(
   types?: CircleIR['types'],
 ): CircleIR['taint']['flows'] {
   const flows: CircleIR['taint']['flows'] = [];
+  const fieldNames = new Set<string>();
+  for (const t of types ?? []) for (const f of t.fields ?? []) fieldNames.add(f.name);
   const callsByLine = new Map<number, typeof calls>();
   for (const call of calls) {
     const existing = callsByLine.get(call.location.line) ?? [];
@@ -1250,7 +1512,18 @@ function detectCollectionFlows(
         if (arg.variable) {
           const varName = arg.variable;
           const scopedName = call.in_method ? `${call.in_method}:${varName}` : varName;
-          if (taintedVars.has(varName) || taintedVars.has(scopedName)) {
+          // Bare `name` that is a field read (no local of that name in this
+          // method) still counts as a field use — Inter4-style. A shadowing
+          // local declaration in the method does not.
+          const expr = arg.expression ?? '';
+          const explicitField = isFieldUseExpression(
+            expr, varName, enclosingTypeNamesAt(types, call.location.line),
+          );
+          const bareFieldRead = fieldNames.has(varName)
+            && expr === varName
+            && !methodHasLocalDecl(code, call.in_method, varName, call.location.line);
+          const isFieldUse = explicitField || bareFieldRead;
+          if (isTaintedInMethod(taintedVars, varName, scopedName, fieldNames, isFieldUse)) {
             // Sprint 13 #70 — pick a source in the same method scope as the
             // sink, not blanket sources[0]. The varName-based match is
             // primary; method-scope is the tiebreaker; sources[0] is the
