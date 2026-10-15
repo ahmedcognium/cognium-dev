@@ -14,7 +14,7 @@
  * Depends on: taint-matcher, constant-propagation
  */
 
-import type { TaintSource, TaintSink, TaintSanitizer, TypeInfo, SourceType, SastFinding, DFG } from '../../types/index.js';
+import type { TaintSource, TaintSink, TaintSanitizer, TypeInfo, ImportInfo, SourceType, SastFinding, DFG } from '../../types/index.js';
 import type { AnalysisPass, PassContext } from '../../graph/analysis-pass.js';
 import {
   DOM_ASSIGNMENT_SINK_METHODS,
@@ -272,6 +272,22 @@ export class LanguageSourcesPass implements AnalysisPass<LanguageSourcesResult> 
           location: s.location,
           method: s.method,
           confidence: 1.0,
+        });
+      }
+    }
+
+    // -- Java (#624): JSPWiki plugin `execute` return is HTML output ------------
+    if (language === 'java') {
+      const tm = ctx.getResult<TaintMatcherResult>('taint-matcher');
+      const xssSan = tm.sanitizers.filter(sa => sa.sanitizes.includes('xss')).map(sa => ({ line: sa.line, method: sa.method }));
+      for (const r of findJavaWikiPluginReturnXSSSinks(code, types, graph.ir.imports, tm.sources, xssSan)) {
+        if (additionalSinks.some(s => s.line === r.sinkLine && s.type === 'xss')) continue;
+        additionalSinks.push({
+          type: 'xss',
+          cwe: 'CWE-79',
+          line: r.sinkLine,
+          location: `WikiPlugin.execute returns HTML with user input at line ${r.sinkLine}`,
+          confidence: 0.9,
         });
       }
     }
@@ -2941,6 +2957,404 @@ const JINJA_SAFE_TEMPLATE_RE = new RegExp(
 function isSafeJinjaReturnExpr(expr: string): boolean {
   const trimmed = expr.trim();
   return JINJA_SAFE_RTS_RE.test(trimmed) || JINJA_SAFE_TEMPLATE_RE.test(trimmed);
+}
+
+/**
+ * The statements on one Java source line, split at each `;` that is outside a
+ * string / char literal and outside a comment. Comment text (`//` to the end of
+ * the line, inline or unterminated `/* ... *\/`) is dropped; literals are kept.
+ * `terminated` is false for a trailing piece with no `;` on this line.
+ */
+function javaLineStatements(line: string): Array<{ text: string; terminated: boolean }> {
+  const out: Array<{ text: string; terminated: boolean }> = [];
+  let cur = '';
+  let inStr: '"' | "'" | null = null;
+  let escaped = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      cur += ch;
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inStr = ch; cur += ch; continue; }
+    if (ch === '/' && line[i + 1] === '/') break;
+    if (ch === '/' && line[i + 1] === '*') {
+      const end = line.indexOf('*/', i + 2);
+      if (end < 0) break;
+      cur += ' ';
+      i = end + 1;
+      continue;
+    }
+    if (ch === ';') { out.push({ text: cur, terminated: true }); cur = ''; continue; }
+    cur += ch;
+  }
+  if (cur.trim()) out.push({ text: cur, terminated: false });
+  return out;
+}
+
+/**
+ * `[modifiers] [Type] name = rhs` as ONE statement (no `;`; see
+ * `javaLineStatements`). `==` is not an assignment; `+=` and field targets
+ * (`a.b = x`) are not matched. Group 1 is the name, group 2 the right-hand side.
+ */
+const JAVA_STMT_ASSIGN =
+  /^\s*(?:(?:final|public|private|protected|static|volatile|transient)\s+)*(?:[\p{L}_][\p{L}\p{N}_.]*(?:\s*<[^=]*>)?(?:\s*\[\s*\])*\s+)?([\p{L}_][\p{L}\p{N}_]*)\s*=(?!=)\s*([\s\S]*)$/u;
+
+/**
+ * Arguments of `receiver.append(...)` on one statement, including a chain of
+ * further `.append(...)` calls on the same expression. Stops at any other
+ * method (e.g. `.indexOf(...)`) or at the end of the statement. Nested calls
+ * inside an argument (e.g. `append(escape(who))`) stay inside that argument.
+ * String / char literal bodies are walked so a `)` inside a string does not
+ * close the argument.
+ */
+function javaAppendArgExprs(line: string): { receiver: string; args: string[] } | null {
+  const start = /^\s*([\p{L}_][\p{L}\p{N}_]*)\s*\.\s*append\s*\(/u.exec(line);
+  if (!start) return null;
+  const receiver = start[1];
+  const args: string[] = [];
+  let i = start[0].length;
+  const takeArg = (): string | null => {
+    let depth = 1;
+    let inStr: '"' | "'" | null = null;
+    let escaped = false;
+    const from = i;
+    for (; i < line.length; i++) {
+      const ch = line[i];
+      if (inStr) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === inStr) inStr = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inStr = ch; continue; }
+      if (ch === '(') { depth++; continue; }
+      if (ch === ')') {
+        depth--;
+        if (depth === 0) {
+          const arg = line.slice(from, i);
+          i++; // past ')'
+          return arg;
+        }
+      }
+    }
+    return null;
+  };
+  while (true) {
+    const arg = takeArg();
+    if (arg === null) return null;
+    args.push(arg);
+    // More chained .append(…)? Otherwise stop (other method, ';', end).
+    const rest = line.slice(i);
+    const next = /^\s*\.\s*append\s*\(/.exec(rest);
+    if (!next) break;
+    i += next[0].length;
+  }
+  return { receiver, args };
+}
+
+/**
+ * The source call named by a source location (`req.getParameter() in execute`,
+ * `getParameter() in execute`) as a regex over `codeOnly` text: the receiver
+ * chain must match too (any spacing between its tokens), and a call with no
+ * receiver must not follow a `.`. `byName` is the method name alone, for a
+ * receiver whose text is not on the line as written. `method` / `receiver`
+ * are the unescaped names from the location. Null when the location names no
+ * call.
+ */
+function javaSourceCallRe(location: string | undefined): {
+  exact: RegExp; byName: RegExp; method: string; receiver: string | null;
+} | null {
+  const callee = /^([\s\S]*?)\(\)(?:\s+in\s+[^()]*)?$/u.exec((location ?? '').trim())?.[1]?.trim();
+  if (!callee) return null;
+  const cm = /^(?:([\s\S]*?)\s*\.\s*)?([\p{L}_$][\p{L}\p{N}_$]*)$/u.exec(callee);
+  if (!cm) return null;
+  const esc = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const methodName = cm[2];
+  const method = esc(methodName);
+  const byName = new RegExp(`(?<![\\p{L}\\p{N}_$])${method}\\s*\\(`, 'u');
+  if (!cm[1]) {
+    return {
+      exact: new RegExp(`(?<![\\p{L}\\p{N}_$.])(?<!\\.\\s+)${method}\\s*\\(`, 'u'),
+      byName, method: methodName, receiver: null,
+    };
+  }
+  // Receiver text as written in the location, with literal bodies blanked like the
+  // statement text it is matched against.
+  const recv = cm[1]
+    .replace(/"(?:[^"\\]|\\.)*"/g, ' ')
+    .replace(/'(?:[^'\\]|\\.)'/g, ' ');
+  const toks = recv.match(/[\p{L}\p{N}_$]+|\S/gu);
+  if (!toks) return null;
+  return {
+    exact: new RegExp(`(?<![\\p{L}\\p{N}_$.])(?<!\\.\\s+)${toks.map(esc).join('\\s*')}\\s*\\.\\s*${method}\\s*\\(`, 'u'),
+    byName, method: methodName, receiver: toks.join(''),
+  };
+}
+
+/** Keywords that must not be treated as a Java type name in a declaration. */
+const JAVA_NON_TYPE_NAMES = new Set([
+  'return', 'if', 'else', 'while', 'for', 'switch', 'case', 'new', 'throw', 'try',
+  'catch', 'class', 'interface', 'package', 'import', 'assert', 'synchronized',
+  'do', 'break', 'continue', 'finally', 'default', 'this', 'super', 'true',
+  'false', 'null', 'instanceof', 'extends', 'implements', 'throws', 'enum',
+]);
+
+/**
+ * Simple type name → last segment of an FQN, generics stripped
+ * (`javax.servlet.http.HttpServletRequest` → `HttpServletRequest`).
+ */
+function javaSimpleTypeName(type: string): string {
+  return type.replace(/\s+/g, '').replace(/<.*$/, '').replace(/^.*\./, '');
+}
+
+/**
+ * Locals and parameters declared in `[startLine, endLine]` (1-based), mapped to
+ * their simple type name. Used so a line that lost a second request-source to
+ * per-line dedup can still seed every receiver of that source class.
+ */
+function javaMethodVarTypes(
+  lines: ReadonlyArray<string>,
+  startLine: number,
+  endLine: number,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  // Optional modifiers, then Type (FQN / simple, optional generics), then name,
+  // then `=` `,` `;` or `)` (parameter list). Strings / comments blanked first.
+  const decl = /(?:(?:public|private|protected|static|final|volatile|transient)\s+)*(?<![\p{L}\p{N}_$.])((?:[\p{L}_$][\p{L}\p{N}_$]*\s*\.\s*)*[\p{L}_$][\p{L}\p{N}_$]*)\s*(?:<[^;{}()=]*>)?\s+([\p{L}_$][\p{L}\p{N}_$]*)\s*(?:=|,|;|\))/gu;
+  for (let i = startLine - 1; i < endLine && i < lines.length; i++) {
+    const text = (lines[i] ?? '')
+      .replace(/"(?:[^"\\]|\\.)*"/g, ' ')
+      .replace(/'(?:[^'\\]|\\.)'/g, ' ')
+      .replace(/\/\*.*?\*\//g, ' ')
+      .replace(/\/\/.*$/, '');
+    decl.lastIndex = 0;
+    for (let m = decl.exec(text); m; m = decl.exec(text)) {
+      const simple = javaSimpleTypeName(m[1]);
+      if (!simple || JAVA_NON_TYPE_NAMES.has(simple)) continue;
+      out.set(m[2], simple);
+    }
+  }
+  return out;
+}
+
+/**
+ * Call matcher for a source location that accepts every receiver declared with
+ * the same simple type as the location's stored receiver (not only that
+ * receiver). Falls back to `exact` when the stored receiver's type is unknown.
+ * When the location names no receiver, returns `exact` (method-only form).
+ */
+function javaSameClassCallRe(
+  srcRes: { exact: RegExp; method: string; receiver: string | null },
+  varTypes: Map<string, string>,
+): RegExp {
+  if (!srcRes.receiver) return srcRes.exact;
+  const esc = (t: string): string => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Location receiver may be a chain (`this.req`); the declared name is the
+  // last identifier.
+  const recvId = /[\p{L}_$][\p{L}\p{N}_$]*$/u.exec(srcRes.receiver)?.[0] ?? srcRes.receiver;
+  const names = new Set<string>([recvId]);
+  const ty = varTypes.get(recvId);
+  if (ty) {
+    for (const [n, t] of varTypes) if (t === ty) names.add(n);
+  }
+  const alts = [...names].map(esc).join('|');
+  return new RegExp(
+    `(?<![\\p{L}\\p{N}_$.])(?<!\\.\\s+)(?:${alts})\\s*\\.\\s*${esc(srcRes.method)}\\s*\\(`,
+    'u',
+  );
+}
+
+/**
+ * `expr` (already `codeOnly`) with every call to the named method blanked out,
+ * from its name through its closing `)` (or the end of `expr` when the call
+ * does not close there). `found` is true when at least one call was blanked.
+ */
+function blankJavaCalls(expr: string, method: string): { text: string; found: boolean } {
+  const re = new RegExp(`(?<![\\p{L}\\p{N}_$])${method.replace(/[$]/g, '\\$&')}\\s*\\(`, 'gu');
+  let text = expr;
+  let found = false;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    let depth = 1;
+    let k = m.index + m[0].length;
+    for (; k < text.length && depth > 0; k++) {
+      if (text[k] === '(') depth++;
+      else if (text[k] === ')') depth--;
+    }
+    text = `${text.slice(0, m.index)} 0 ${text.slice(k)}`;
+    re.lastIndex = m.index + 3;
+    found = true;
+  }
+  return { text, found };
+}
+
+/**
+ * cognium-dev#624 (minimal slice) — JSPWiki plugin output is rendered as HTML.
+ *
+ * The `String` returned from `execute(...)` of a class that implements
+ * `org.apache.wiki.api.plugin.WikiPlugin` (or the older `...plugin.Plugin`) is
+ * written into the page unescaped, so a request- or markup-derived value that
+ * reaches the return is reflected XSS. The rule keys on the interface (from the
+ * import or a fully-qualified `implements`), never on the method name: another
+ * class's `execute(...)` is untouched.
+ *
+ * Mirrors `findPythonReturnXSSSinks` (#368): one sink per tainted `return`, and
+ * `TaintPropagationPass` links it to a source. `StringBuilder.append` is
+ * deliberately not an xss sink on its own (#268) — a builder only matters here
+ * when it reaches the return. An xss-covering sanitizer between the source and
+ * the return suppresses the site.
+ */
+export function findJavaWikiPluginReturnXSSSinks(
+  code: string,
+  types: ReadonlyArray<TypeInfo>,
+  imports: ReadonlyArray<ImportInfo>,
+  sources: ReadonlyArray<{ line: number; variable?: string; location?: string }>,
+  xssSanitizers: ReadonlyArray<{ line: number; method?: string }>,
+): Array<{ sinkLine: number; sourceLine: number }> {
+  if (sources.length === 0) return [];
+  const PKG = 'org.apache.wiki.api.plugin';
+  // Each simple name counts only when that name was imported (a wildcard of the
+  // plugin package accepts both): importing `WikiPlugin` does not make an
+  // `implements Plugin` (some other interface) a wiki plugin, nor the reverse.
+  const importedSimple = new Set<string>();
+  let wildcardImported = false;
+  for (const i of imports) {
+    if (i.from_package !== PKG) continue;
+    if (i.is_wildcard) wildcardImported = true;
+    else if (i.imported_name === 'WikiPlugin' || i.imported_name === 'Plugin') importedSimple.add(i.imported_name);
+  }
+  const isPluginIface = (name: string): boolean => {
+    const bare = name.replace(/<.*$/, '').trim();
+    if (bare === `${PKG}.WikiPlugin` || bare === `${PKG}.Plugin`) return true;
+    return (bare === 'WikiPlugin' || bare === 'Plugin') && (wildcardImported || importedSimple.has(bare));
+  };
+  const lines = code.split('\n');
+  // Code positions only: string / char literal bodies blanked, then inline `/* */` and
+  // trailing `//` comments dropped (after the literals, so a `"http://…"` is not cut).
+  const codeOnly = (expr: string): string => expr
+    .replace(/"(?:[^"\\]|\\.)*"/g, ' ')
+    .replace(/'(?:[^'\\]|\\.)'/g, ' ')
+    .replace(/\/\*.*?\*\//g, ' ')
+    .replace(/\/\/.*$/, '');
+  const refs = (expr: string, name: string): boolean =>
+    new RegExp(`(?<![\\p{L}\\p{N}_.])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}\\p{N}_])`, 'u').test(expr);
+
+  const out: Array<{ sinkLine: number; sourceLine: number }> = [];
+  for (const t of types) {
+    if (!t.implements.some(isPluginIface)) continue;
+    for (const m of t.methods) {
+      if (m.name !== 'execute' || m.return_type !== 'String') continue;
+      const inMethod = sources.filter(sc => sc.line >= m.start_line && sc.line <= m.end_line);
+      if (inMethod.length === 0) continue;
+      // Sources that name a variable (the carriers are walked per return below).
+      const perSource = inMethod
+        .filter((sc): sc is { line: number; variable: string; location?: string } => !!sc.variable)
+        .map(sc => ({ sc }));
+      if (perSource.length === 0) continue;
+      for (let i = m.start_line - 1; i < m.end_line; i++) {
+        const rm = /^\s*return\s+(.+?);\s*$/.exec(lines[i] ?? '');
+        if (!rm) continue;
+        const sinkLine = i + 1;
+        let best: { line: number } | null = null;
+        for (const { sc } of perSource) {
+          if (sc.line > sinkLine) continue;
+          // Carriers: the names the source's value reaches before the return, with
+          // the line each became tainted. Walked one statement at a time, in order,
+          // from the source's own statement: a name is live only after the statement
+          // that gives it a tainted value (the source call, or an already-live
+          // carrier), so a statement earlier on the same line sees nothing. Only
+          // names inside a statement's append(...) arguments (chained .append and
+          // nested calls included) taint its receiver, only its `+=` right-hand
+          // side taints its target, and only its `=` right-hand side taints the
+          // assigned name. A name in another method or statement does not.
+          const carriers = new Map<string, number>();
+          const refsCarrier = (expr: string): boolean => {
+            const c = codeOnly(expr);
+            return [...carriers.keys()].some(v => refs(c, v));
+          };
+          // Where the source enters on its line. Call sources are deduped to one
+          // per line, so the surviving location names only one receiver
+          // ("req.getParameter() in execute"). Accept every call whose receiver
+          // shares that source class (another HttpServletRequest on the line),
+          // not only the stored receiver — otherwise a second request call never
+          // seeds its value. `prefs.getParameter` stays out: different class.
+          // `byName` (method alone) must not run when the line has another
+          // same-named call: that reintroduces the method-name FP. A parameter /
+          // annotation source (no call) is live from its own assignment on the
+          // line, or from the start of the line.
+          const srcStmts = javaLineStatements(lines[sc.line - 1] ?? '');
+          const srcRes = javaSourceCallRe(sc.location);
+          const varTypes = javaMethodVarTypes(lines, m.start_line, m.end_line);
+          let callRe: RegExp | null = null;
+          if (srcRes) {
+            const hasExact = srcStmts.some(st => srcRes.exact.test(codeOnly(st.text)));
+            const byNameHits = srcStmts.filter(st => srcRes.byName.test(codeOnly(st.text))).length;
+            if (hasExact) callRe = javaSameClassCallRe(srcRes, varTypes);
+            else if (byNameHits === 1) callRe = srcRes.byName;
+            else callRe = srcRes.receiver ? javaSameClassCallRe(srcRes, varTypes) : null;
+          }
+          const callsSource = (expr: string): boolean => !!callRe && callRe.test(codeOnly(expr));
+          const seeded = srcStmts.some(st => callsSource(st.text));
+          // xss sanitizer calls on the source line: a value that reaches a
+          // statement only inside one of them is not tainted by it. A sanitizer
+          // that cannot be found in the line's text covers the whole line.
+          const srcLineSan = sc.line < sinkLine
+            ? xssSanitizers.filter(sa => sa.line === sc.line).map(sa => ({
+                method: /([\p{L}_$][\p{L}\p{N}_$]*)\s*(?:\(\))?\s*$/u.exec(sa.method ?? '')?.[1],
+              }))
+            : [];
+          const sanMethods = srcLineSan.map(sa => sa.method).filter((x): x is string => !!x);
+          const srcLineSanFound = srcLineSan.length > 0 && srcLineSan.every(sa =>
+            !!sa.method && srcStmts.some(st => blankJavaCalls(codeOnly(st.text), sa.method as string).found));
+          const unsanitized = (expr: string): string => {
+            let text = codeOnly(expr);
+            if (srcLineSanFound) for (const sm of sanMethods) text = blankJavaCalls(text, sm).text;
+            return text;
+          };
+          // Unseeded: index of the statement after which `sc.variable` is live.
+          let liveAfter = -1;
+          if (!seeded) liveAfter = srcStmts.findIndex(st => JAVA_STMT_ASSIGN.exec(st.text)?.[1] === sc.variable);
+          // A source on the return line itself is checked against the return as is.
+          if ((!seeded && liveAfter < 0) || sc.line === sinkLine) carriers.set(sc.variable, sc.line);
+          for (let j = sc.line - 1; j < i; j++) {
+            const onSrcLine = j === sc.line - 1;
+            const stmts = onSrcLine ? srcStmts : javaLineStatements(lines[j] ?? '');
+            for (let k = 0; k < stmts.length; k++) {
+              const st = stmts[k];
+              const raw = (expr: string): boolean => refsCarrier(expr) || (onSrcLine && seeded && callsSource(expr));
+              const tainted = (expr: string): boolean => (onSrcLine ? raw(unsanitized(expr)) : raw(expr));
+              const as = JAVA_STMT_ASSIGN.exec(st.text);
+              // A name reassigned on the source line from a sanitized value only
+              // (`who = escapeHtml4(who)`) no longer carries the source.
+              if (as && onSrcLine && srcLineSanFound && carriers.has(as[1]) && raw(as[2]) && !tainted(as[2])) carriers.delete(as[1]);
+              else if (as && !carriers.has(as[1]) && tainted(as[2])) carriers.set(as[1], j + 1);
+              const ap = javaAppendArgExprs(st.text);
+              if (ap && !carriers.has(ap.receiver) && ap.args.some(a => tainted(a))) carriers.set(ap.receiver, j + 1);
+              const cm = st.terminated ? /^\s*([\p{L}_][\p{L}\p{N}_]*)\s*\+=\s*(.+?)\s*$/u.exec(st.text) : null;
+              if (cm && !carriers.has(cm[1]) && tainted(cm[2])) carriers.set(cm[1], j + 1);
+              if (onSrcLine && !seeded && k === liveAfter && !carriers.has(sc.variable)) carriers.set(sc.variable, sc.line);
+            }
+          }
+          if (!refsCarrier(rm[1])) continue;
+          // An xss-covering sanitizer only counts for this source when it is on a
+          // later line that names one of its carriers. One on the source's own
+          // line already took effect in the walk above (only the value inside
+          // its argument is clean); one there that is not found in the line's
+          // text, or a source on the return line, still covers the line.
+          const sanitized = xssSanitizers.some(({ line: l }) =>
+            l >= sc.line && l <= sinkLine &&
+            (l === sc.line ? !srcLineSanFound : refsCarrier(lines[l - 1] ?? '')));
+          if (sanitized) continue;
+          if (!best || sc.line > best.line) best = { line: sc.line };
+        }
+        if (best) out.push({ sinkLine, sourceLine: best.line });
+      }
+    }
+  }
+  return out;
 }
 
 export function findPythonReturnXSSSinks(

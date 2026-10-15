@@ -336,6 +336,60 @@ function argvFirstLiteralIsShell(lineText: string): boolean {
   return SHELL_PROGRAMS.has(base);
 }
 
+/**
+ * cognium-dev#626 — does a same-file call of the wrapper method that contains
+ * the sink pass a shell argv (`Arrays.asList("/bin/sh", "-c", ...)`,
+ * `List.of("bash", ...)`, `new String[]{"sh", ...}`) at the position of its
+ * parameter `paramName`?
+ *
+ * Reuses the #351 literal test (`argvFirstLiteralIsShell`) on the caller's
+ * argument text, so the criterion is the same one the inline form already
+ * obeys. The wrapper is the method (name and parameter list) of the declaring
+ * type that contains the sink line. A call counts only when it has no receiver
+ * or a `this` receiver, sits in that same type, and passes the same number of
+ * arguments, so a call on another object, another class's method of the same
+ * name or another overload is ignored, and so is a call inside a nested type
+ * that declares its own method of that name and arity (it calls that one, not
+ * the wrapper; `enclosing_type` is unset on the default path, so the nested
+ * type is found by its line range). A parameter that is not found answers
+ * `false` and today's suppression stands.
+ */
+function sameFileCallerPassesShellArgv(
+  paramName: string,
+  methodName: string | null | undefined,
+  sinkLine: number,
+  types: ReadonlyArray<TypeInfo>,
+  calls: ReadonlyArray<CallInfo>,
+): boolean {
+  if (!methodName) return false;
+  for (const t of types) {
+    const m = t.methods.find(mm => mm.name === methodName && sinkLine >= mm.start_line && sinkLine <= mm.end_line);
+    if (!m) continue;
+    const pos = m.parameters.findIndex(p => p.name === paramName);
+    if (pos < 0) return false;
+    return calls.some(c => {
+      if (c.method_name !== methodName) return false;
+      if (c.receiver != null && c.receiver !== 'this') return false;
+      if (c.location.line < t.start_line || c.location.line > t.end_line) return false;
+      if (c.arguments.length !== m.parameters.length) return false;
+      // A call inside a nested type that declares its own `methodName` of the
+      // same arity calls that method, not this wrapper (the outer type's line
+      // span covers the nested one). A nested call with no such method still
+      // resolves to the outer wrapper and counts.
+      const shadowed = types.some(u =>
+        u !== t &&
+        u.start_line >= t.start_line && u.end_line <= t.end_line &&
+        (u.start_line > t.start_line || u.end_line < t.end_line) &&
+        c.location.line >= u.start_line && c.location.line <= u.end_line &&
+        u.methods.some(um => um.name === methodName && um.parameters.length === c.arguments.length));
+      if (shadowed) return false;
+      const expr = c.arguments[pos]?.expression;
+      return typeof expr === 'string' && argvFirstLiteralIsShell(`new ProcessBuilder(${expr}`);
+    });
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Stage 12 — Java throw-statement FP suppression.
 // (cognium-dev #157 — Sprint 45)
@@ -1771,7 +1825,12 @@ export class SinkFilterPass implements AnalysisPass<SinkFilterResult> {
         // Bare identifier — parameter/field lookup.
         if (varName !== '' && argExpr === varName && !/[(.]/.test(argExpr)) {
           const t = resolveIdentifierType(varName, ctorCall.in_method, irTypes);
-          if (isArgvContainerType(t)) return false;
+          // cognium-dev#626: a `List<String>` PARAMETER is argv-form only while no
+          // same-file caller hands it a shell argv (`/bin/sh -c <script>`): then
+          // the tainted element is the script, so the suppression proves nothing.
+          if (isArgvContainerType(t) && !sameFileCallerPassesShellArgv(varName, ctorCall.in_method, ctorCall.location.line, irTypes, irCalls)) {
+            return false;
+          }
         }
         // Method call — return-type lookup. `variable` field carries the
         // callee name for call-expression args.

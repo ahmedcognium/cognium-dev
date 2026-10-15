@@ -19,7 +19,7 @@ import type { SinkFilterResult } from './sink-filter-pass.js';
 import { findJavaSpringReturnXSSSinks } from './language-sources-pass.js';
 import { identifierOutsideSanitizerCalls, propagateTaint } from '../taint-propagation.js';
 import { isFalsePositive, isCorrelatedPredicateFP } from '../constant-propagation.js';
-import { buildJavaTaintedVars, buildPythonTaintedVars, buildRustTaintedVars, findPythonTrustBoundaryViolations, findPythonReturnXSSSinks } from './language-sources-pass.js';
+import { buildJavaTaintedVars, buildPythonTaintedVars, buildRustTaintedVars, findPythonTrustBoundaryViolations, findPythonReturnXSSSinks, findJavaWikiPluginReturnXSSSinks } from './language-sources-pass.js';
 import { canSourceReachSink, sourceSemanticsAllowed } from '../findings.js';
 import { walkBackwardDefs } from '../dfg-walk.js';
 import { sanitizerCoversSink } from '../sanitizer-index.js';
@@ -491,6 +491,40 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
       }
     }
 
+    // Supplement: Java JSPWiki plugin return-XSS flows — cognium-dev#624. The
+    // sink synthesised by `LanguageSourcesPass` has no method or argument, so
+    // no argument matcher can reach it; link it to its source here, as for the
+    // Python return-XSS shape above. The helper already applies its own
+    // statement-level sanitizer check, so these flows skip the line-keyed
+    // def-chain credit below (a sanitizer elsewhere on a def line of the
+    // returned name does not cover it).
+    const wikiPluginFlowKeys = new Set<string>();
+    if (ctx.language === 'java' && typeof ctx.code === 'string') {
+      const xssSanitizers = sanitizers
+        .filter(sa => sa.sanitizes.includes('xss'))
+        .map(sa => ({ line: sa.line, method: sa.method }));
+      for (const rx of findJavaWikiPluginReturnXSSSinks(ctx.code, types, graph.ir.imports, sources, xssSanitizers)) {
+        if (constProp.unreachableLines.has(rx.sinkLine)) continue;
+        const sink = sinks.find(sk => sk.line === rx.sinkLine && sk.type === 'xss');
+        if (!sink) continue;
+        const src = sources.find(sc => sc.line === rx.sourceLine);
+        if (!src) continue;
+        wikiPluginFlowKeys.add(`${src.line}:${rx.sinkLine}`);
+        pushIfNew({
+          source_line: src.line,
+          sink_line: rx.sinkLine,
+          source_type: src.type,
+          sink_type: 'xss',
+          path: [
+            { variable: src.variable ?? 'response', line: src.line, type: 'source' as const },
+            { variable: src.variable ?? 'response', line: rx.sinkLine, type: 'sink' as const },
+          ],
+          confidence: (src.confidence ?? 1) * (sink.confidence ?? 1),
+          sanitized: false,
+        });
+      }
+    }
+
     // Supplement: array element flows
     // Sprint 82 (#189) — dedup keys on (source_line, sink_line, sink_type) so
     // distinct sink-types at the same call site (e.g. `res.redirect` registered
@@ -690,6 +724,7 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
         // in taint-propagation.ts checkSanitized. Doesn't over-suppress
         // bare `shlex.quote(host)` on unrelated non-sink lines because
         // those calls don't create a def in the sink var's chain.
+        if (f.sink_type === 'xss' && wikiPluginFlowKeys.has(`${f.source_line}:${f.sink_line}`)) return true;
         const usesAtSink = graph.usesByLine.get(f.sink_line);
         if (!usesAtSink || usesAtSink.length === 0) return true;
         const sinkVar = f.path.length > 0
@@ -2555,7 +2590,15 @@ function detectExpressionScanFlows(
   // tainted var (at the CommandText line) so the arg-scan links the Execute sink.
   if (language === 'csharp' && typeof code === 'string' && sourcesWithVar.length > 0) {
     const lines = code.split('\n');
-    const ctRe = /(\w+)\s*\.\s*CommandText\s*\+?=\s*(.+)/;
+    // cognium-dev#594: `X.StartInfo.FileName = <tainted>` is the same shape for a
+    // `System.Diagnostics.Process`: the executable path rides the process object
+    // and the zero-argument `X.Start()` is the injection point. Only the
+    // `FileName` write seeds it (`Arguments` / `ArgumentList` are a separate
+    // follow-up), so a constant `FileName` beside an unrelated tainted
+    // parameter stays clean.
+    // A write only: `+=` or a single `=` that is not part of `==`, `!=`, `<=`, `>=`
+    // (`if (p.StartInfo.FileName == tool)` is a comparison, not an assignment).
+    const ctRe = /(\w+)\s*\.\s*(?:CommandText|StartInfo\s*\.\s*FileName)\s*(?:\+=|(?<![=!<>])=(?!=))\s*(.+)/;
     // cognium-dev#548: seed per method, from sources in that method. The seed
     // used to be made once per file and matched by name, so `cmd.CommandText =
     // … + data` in `Bad()` tainted `cmd.ExecuteScalar()` in `GoodG2B()`, whose
