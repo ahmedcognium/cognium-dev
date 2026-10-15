@@ -683,6 +683,25 @@ export class LanguageSourcesPass implements AnalysisPass<LanguageSourcesResult> 
       additionalSanitizers.push(...findJavaCanonicalPathStartsWithGuardSanitizers(code));
       // cognium-dev#293: `if (!Set.of("a", "b").contains(key)) throw` allow-list guard.
       additionalSanitizers.push(...findJavaLiteralAllowlistGuardSanitizers(code));
+      // cognium-dev#668: `!<literal set>.contains(cls)` reject guard before reflection.
+      additionalSanitizers.push(...findJavaReflectionAllowlistGuardSanitizers(code, types));
+      // cognium-dev#566: a Spring @RestController / @ResponseBody / ResponseEntity
+      // handler's returned String is the response body. TaintPropagationPass
+      // links each synthesised sink to its source.
+      {
+        const tm = ctx.getResult<TaintMatcherResult>('taint-matcher');
+        const xssSan = tm.sanitizers.filter(sa => sa.sanitizes.includes('xss')).map(sa => sa.line);
+        for (const r of findJavaSpringReturnXSSSinks(code, types, tm.sources, xssSan)) {
+          if (additionalSinks.some(s => s.line === r.sinkLine && s.type === 'xss')) continue;
+          additionalSinks.push({
+            type: 'xss',
+            cwe: 'CWE-79',
+            line: r.sinkLine,
+            location: `Spring handler returns HTML with request input at line ${r.sinkLine}`,
+            confidence: 0.9,
+          });
+        }
+      }
       additionalSanitizers.push(...findJavaInlineCrlfStripLogSanitizers(code));
       // cognium-dev#293: the same strip, but living in a user-defined helper.
       additionalSanitizers.push(...findCrlfWrapperFunctionSanitizers(code, 'java'));
@@ -6127,6 +6146,140 @@ function findJavaCanonicalPathStartsWithGuardSanitizers(code: string): TaintSani
 }
 
 /**
+ * Identifiers allowed in the initializer of a constant allowlist collection.
+ * Anything else (a method parameter, a request read, a config lookup) means
+ * the membership set is not a fixed set of literals.
+ */
+const JAVA_LITERAL_COLLECTION_IDENTS = new Set([
+  'new', 'String', 'Set', 'List', 'of', 'copyOf', 'Arrays', 'asList',
+  'HashSet', 'TreeSet', 'LinkedHashSet', 'ArrayList', 'LinkedList',
+  'Collections', 'unmodifiableSet', 'unmodifiableList',
+  'ImmutableSet', 'ImmutableList', 'java', 'util',
+]);
+
+/**
+ * cognium-dev#668 — Java reflection allowlist guard.
+ *
+ *   private static final Set<String> ALLOWED = Set.of("a.Csv", "a.Json");
+ *   if (!ALLOWED.contains(cls)) { throw new SecurityException("denied"); }
+ *   return Class.forName(cls).getDeclaredConstructor().newInstance();
+ *
+ * Past a rejecting `!<SET>.contains(<v>)` guard, `<v>` is one of the set's
+ * literals, so the class it names is chosen by the code, not the requester.
+ * Positive evidence only: `<SET>` must be a `final` field or local of this
+ * file whose initializer is nothing but string literals inside the standard
+ * collection factories, and the guard must reject (throw / return). Credits
+ * `<v>` on later lines of the enclosing method until `<v>` is reassigned.
+ * Scoped to `code_injection` (reflective class loading); other sink types
+ * are untouched.
+ */
+function findJavaReflectionAllowlistGuardSanitizers(
+  code: string,
+  types: ReadonlyArray<TypeInfo>,
+): TaintSanitizer[] {
+  const sanitizers: TaintSanitizer[] = [];
+  const lines = code.split('\n');
+  const guardRe =
+    /\bif\s*\(\s*!\s*(?:this\s*\.\s*|[A-Z]\w*\s*\.\s*)?([A-Za-z_]\w*)\s*\.\s*contains\s*\(\s*([A-Za-z_]\w*)\s*\)\s*\)/;
+  const terminatorRe = /\b(throw|return)\b/;
+
+  // Factory / constructor tokens that prove the initializer is a collection of
+  // literals. A bare `final String ALLOWED = "…"` leaves no idents after string
+  // stripping (so `.every` would pass) and `String.contains` is substring — not
+  // an allowlist. Require at least one of these.
+  const LITERAL_COLLECTION_FACTORIES = new Set([
+    'of', 'copyOf', 'asList', 'HashSet', 'TreeSet', 'LinkedHashSet',
+    'ArrayList', 'LinkedList', 'unmodifiableSet', 'unmodifiableList',
+    'ImmutableSet', 'ImmutableList',
+  ]);
+
+  /**
+   * Nearest declaration of `name` at or above `fromLine` (0-based). A closer
+   * non-final binding (local, `var`, parameter) wins over an earlier `final`
+   * field; only a nearest `final` literal collection returns true.
+   */
+  const isLiteralCollection = (name: string, fromLine: number): boolean => {
+    const finalDeclRe = new RegExp(`\\bfinal\\b[^=;(]*\\b${name}\\s*=(?!=)`);
+    // Type/var declaration or use as a parameter (`Type name` before `=` / `;` / `,` / `)`).
+    const anyDeclRe = new RegExp(`\\b(?:[A-Z][\\w.<>,\\[\\]?\\s]*|var)\\s+${name}\\s*[=;,)]`);
+    for (let i = fromLine; i >= 0; i--) {
+      const line = lines[i];
+      if (!anyDeclRe.test(line) && !finalDeclRe.test(line)) continue;
+      const dm = finalDeclRe.exec(line);
+      if (!dm) return false; // nearer non-final binding — not a fixed allowlist
+      // Initializer up to the terminating `;` (may span a few lines).
+      let init = line.slice(dm.index + dm[0].length);
+      for (let j = i + 1; !init.includes(';') && j < Math.min(lines.length, i + 12); j++) init += ' ' + lines[j];
+      if (!init.includes(';')) return false;
+      init = init.slice(0, init.indexOf(';')).replace(/"(?:[^"\\]|\\.)*"/g, '""');
+      if (!init.includes('""')) return false;
+      const idents = init.match(/[A-Za-z_]\w*/g) ?? [];
+      // Empty idents (string-only initializer) or no collection factory → not a set.
+      if (!idents.some(id => LITERAL_COLLECTION_FACTORIES.has(id))) return false;
+      if (!idents.every(id => JAVA_LITERAL_COLLECTION_IDENTS.has(id))) return false;
+      // A mutable collection that is written anywhere is not a fixed set.
+      const mutRe = new RegExp(`\\b${name}\\s*\\.\\s*(?:add|addAll|put|putAll|set|replaceAll)\\s*\\(`);
+      return !lines.some(l => mutRe.test(l));
+    }
+    return false;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const m = guardRe.exec(lines[i]);
+    if (!m) continue;
+    const [, setName, guarded] = m;
+    if (!guardRejects(lines, i, terminatorRe, 6)) continue;
+    if (!isLiteralCollection(setName, i)) continue;
+    const method = types
+      .flatMap(t => t.methods)
+      .filter(mt => mt.start_line <= i + 1 && mt.end_line >= i + 1)
+      .sort((a, b) => (a.end_line - a.start_line) - (b.end_line - b.start_line))[0];
+    if (!method) continue;
+    // The guard must sit in the method body's top-level block, so it dominates
+    // every later line (not inside an `if` branch, loop or lambda body).
+    const before = [...lines.slice(method.start_line - 1, i), lines[i].slice(0, m.index)]
+      .join('\n').replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    const depth = (before.match(/\{/g) ?? []).length - (before.match(/\}/g) ?? []).length;
+    if (depth !== 1) continue;
+    // Braceless `if`/`for`/`while`/`else` keeps brace-depth 1, so also reject a
+    // guard that is the body of a preceding braceless control statement — on the
+    // same line (`if (strict) if (!SET.contains(v))`) or the previous statement
+    // (`} else` / `else` / `if (x)` without `{`).
+    const samePrefix = lines[i].slice(0, m.index).replace(/\/\/.*$/, '').trim();
+    let prev = '';
+    for (let p = i - 1; p >= method.start_line - 1; p--) {
+      const t = lines[p].replace(/\/\/.*$/, '').trim();
+      if (!t) continue;
+      prev = t;
+      break;
+    }
+    const openBraceless = (s: string): boolean => {
+      // Allow a leading `}` so `} else` counts as braceless else.
+      const t = s.replace(/^\}+\s*/, '').trim();
+      return /^(?:else(?:\s+if\b)?|if|for|while)\b/.test(t) && !s.includes('{');
+    };
+    if (openBraceless(samePrefix) || (prev && openBraceless(prev))) continue;
+    const refRe = new RegExp(`(?<![\\w.])${guarded}\\b`);
+    // Credit only lines where `<v>` is a whole call argument, `f(<v>)`, so a
+    // second tainted value on the same line (`forName(v + other)`) still reports.
+    const wholeArgRe = new RegExp(`\\(\\s*${guarded}\\s*\\)`);
+    const reassignRe = new RegExp(`(?<![\\w.])${guarded}\\s*(?:=(?!=)|\\+=)`);
+    for (let l = i + 1; l < Math.min(method.end_line, lines.length); l++) {
+      const lt = lines[l];
+      if (reassignRe.test(lt)) break;
+      if (!refRe.test(lt) || !wholeArgRe.test(lt)) continue;
+      sanitizers.push({
+        type: 'java_reflection_allowlist_guard',
+        method: 'contains',
+        line: l + 1,
+        sanitizes: ['code_injection'],
+      });
+    }
+  }
+  return sanitizers;
+}
+
+/**
  * Does the `if (...)` guard on `lines[i]` actually **reject**?
  *
  * Path-containment guards (`!full.startsWith(root)`) only sanitise when the
@@ -11321,4 +11474,208 @@ export function findJsTemplateInjectionSstiFindings(
     });
   }
   return findings;
+}
+
+// ---------------------------------------------------------------------------
+// cognium-dev#566 — Spring MVC return-as-body XSS (Java)
+// ---------------------------------------------------------------------------
+
+const SPRING_MAPPING_ANN = /^(?:Get|Post|Put|Delete|Patch|Request)Mapping\b/;
+const SPRING_WEB_PARAM_ANN = /^(?:RequestParam|PathVariable|RequestHeader|CookieValue|MatrixVariable)\b/;
+const SPRING_NON_TEXT_PARAM_TYPE =
+  /^(?:int|long|short|byte|double|float|boolean|char|Integer|Long|Short|Byte|Double|Float|Boolean|Character|BigDecimal|BigInteger|UUID|LocalDate|LocalDateTime|LocalTime|Instant|OffsetDateTime|ZonedDateTime|Date)$/;
+
+/**
+ * Value of `produces = …` on a `@*Mapping` annotation, or null when absent.
+ * Only the produces value is considered — a path like `/widgets.html` must not
+ * look like an HTML media type.
+ */
+function springProducesValue(annotations: ReadonlyArray<string>): string | null {
+  for (const a of annotations) {
+    if (!/^\w+Mapping\b/.test(a) || !/\bproduces\s*=/.test(a)) continue;
+    const m = /\bproduces\s*=\s*(?:\{([^}]*)\}|([^,)]+))/.exec(a);
+    if (!m) continue;
+    return (m[1] ?? m[2] ?? '').trim();
+  }
+  return null;
+}
+
+/** True when a produces value names a non-HTML media type. */
+function springProducesValueIsNonHtml(value: string): boolean {
+  return !/html/i.test(value);
+}
+
+/** Markup or string concatenation around a value (the Python return-XSS gate, #368). */
+function javaExprLooksLikeHtml(expr: string): boolean {
+  return /"[^"]*<[^"]*"/.test(expr) || /"\s*\+/.test(expr) || /\+\s*"/.test(expr);
+}
+
+/** Parentheses outside string literals never close below depth 0 and end at 0. */
+function javaParensBalanced(expr: string): boolean {
+  let depth = 0;
+  for (const ch of expr.replace(/"(?:[^"\\]|\\.)*"/g, '""')) {
+    if (ch === '(') depth++;
+    else if (ch === ')' && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+/**
+ * cognium-dev#566 — the value a Spring MVC handler returns is the response
+ * body when the class is `@RestController` (or `@ResponseBody` sits on the
+ * class or the method), and always when the handler returns a
+ * `ResponseEntity`. A `String` body is written with the negotiated content
+ * type, so a browser request gets it as `text/html`: request data
+ * concatenated into markup there is reflected XSS.
+ *
+ * Positive evidence only:
+ *   - the method carries a `@*Mapping` annotation;
+ *   - it returns `String` under a body-writing controller, or
+ *     `ResponseEntity<String>` via `ResponseEntity.ok(x)` /
+ *     `new ResponseEntity<>(x, …)` (the builder `.body(x)` form is left to
+ *     SinkFilterPass Stage 15c's text/html content-type rule);
+ *   - the returned expression references a request-bound parameter
+ *     (`@RequestParam`, `@PathVariable`, `@RequestHeader`, `@CookieValue`,
+ *     `@MatrixVariable`, a `String` `@RequestBody`) or an in-method source,
+ *     directly or through a local assigned from it, and looks like HTML
+ *     (markup or string concatenation, directly or in that local's assignment).
+ *
+ * Not a sink: a plain `@Controller` returning a `String` (a view name),
+ * `produces = ` a non-HTML media type on the method or class mapping, a
+ * non-`String` return (serialised as JSON), a returned value that does not
+ * look like markup, and any handler with an xss-covering sanitizer between
+ * its start and the return.
+ */
+export function findJavaSpringReturnXSSSinks(
+  code: string,
+  types: ReadonlyArray<TypeInfo>,
+  sources: ReadonlyArray<{ line: number; type: string; variable?: string }>,
+  xssSanitizerLines: ReadonlyArray<number>,
+): Array<{ sinkLine: number; sourceLine: number }> {
+  const out: Array<{ sinkLine: number; sourceLine: number }> = [];
+  const lines = code.split('\n');
+  const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const stripStrings = (s: string): string => s.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  const refers = (expr: string, name: string): boolean =>
+    new RegExp(`(?<![\\w.])${esc(name)}\\b`).test(stripStrings(expr));
+
+  for (const t of types) {
+    const ann = t.annotations ?? [];
+    const isRest = ann.some(a => /^RestController\b/.test(a));
+    if (!isRest && !ann.some(a => /^Controller\b/.test(a))) continue;
+    const classProduces = springProducesValue(ann);
+    const classBody = isRest || ann.some(a => /^ResponseBody\b/.test(a));
+
+    for (const m of t.methods) {
+      if (!m.annotations.some(a => SPRING_MAPPING_ANN.test(a))) continue;
+      // Method-level produces overrides class-level; only non-HTML suppresses.
+      const methodProduces = springProducesValue(m.annotations);
+      const produces = methodProduces ?? classProduces;
+      if (produces != null && springProducesValueIsNonHtml(produces)) continue;
+      const rt = (m.return_type ?? '').replace(/\s+/g, '');
+      const entity = rt === 'ResponseEntity<String>';
+      const body = rt === 'String' && (classBody || m.annotations.some(a => /^ResponseBody\b/.test(a)));
+      if (!entity && !body) continue;
+
+      // Seeds: request-bound parameters, then in-method sources with a variable.
+      const seeds = new Map<string, number>();
+      for (const p of m.parameters) {
+        // Spring converts to the declared type first: a number, boolean,
+        // UUID or date cannot carry markup.
+        if (SPRING_NON_TEXT_PARAM_TYPE.test((p.type ?? '').replace(/^(?:[\w]+\.)+/, ''))) continue;
+        const bound = p.annotations.some(a => SPRING_WEB_PARAM_ANN.test(a))
+          || (p.annotations.some(a => /^RequestBody\b/.test(a)) && p.type === 'String');
+        if (bound) seeds.set(p.name, p.line ?? m.start_line);
+      }
+      for (const s of sources) {
+        // A plain parameter of the handler is not request data by itself.
+        if (s.type === 'interprocedural_param') continue;
+        if (!s.variable || !/^[A-Za-z_]\w*$/.test(s.variable)) continue;
+        if (s.line > m.start_line && s.line <= m.end_line && !seeds.has(s.variable)) seeds.set(s.variable, s.line);
+      }
+      if (seeds.size === 0) continue;
+
+      // Locals assigned from a seed (method body only), each tied to its seed's line.
+      const bodyText = lines.slice(m.start_line - 1, m.end_line).join('\n');
+      const carriers = new Map<string, { sourceLine: number; assignLine: number }>();
+      for (const [n, l] of seeds) carriers.set(n, { sourceLine: l, assignLine: l });
+      const derived = [...buildJavaTaintedVars(bodyText, new Set(seeds.keys()))].sort((a, b) => a[1] - b[1]);
+      for (const [n, rel] of derived) {
+        if (carriers.has(n)) continue;
+        const assignLine = m.start_line + rel - 1;
+        const from = [...carriers].find(([c]) => refers(lines[assignLine - 1] ?? '', c));
+        carriers.set(n, { sourceLine: from ? from[1].sourceLine : m.start_line, assignLine });
+      }
+
+      for (let i = m.start_line - 1; i < Math.min(m.end_line, lines.length); i++) {
+        if (!/^\s*return\b/.test(lines[i] ?? '')) continue;
+        let stmt = lines[i];
+        for (let j = i + 1; !stmt.includes(';') && j < Math.min(m.end_line, lines.length); j++) stmt += ' ' + lines[j];
+        stmt = stmt.replace(/^\s*return\b/, '').replace(/;[^;]*$/, '');
+        const sinkLine = i + 1;
+
+        let expr = stmt;
+        if (entity) {
+          // `ResponseEntity.ok(x)` / `new ResponseEntity<>(x, status)` only. The
+          // builder `.body(x)` form stays with SinkFilterPass Stage 15c, which
+          // keeps it only next to an explicit text/html signal.
+          const em = /^\s*ResponseEntity\s*\.\s*ok\s*\(([\s\S]+)\)\s*$/.exec(stmt)
+            ?? /^\s*new\s+ResponseEntity\s*(?:<[^>]*>)?\s*\(([\s\S]+),[^,()]*\)\s*$/.exec(stmt);
+          if (!em || !javaParensBalanced(em[1])) continue;
+          expr = em[1];
+        }
+        const hit = [...carriers].find(([c, info]) => info.assignLine <= sinkLine && refers(expr, c));
+        if (!hit) continue;
+        const [name, info] = hit;
+        let htmlish = javaExprLooksLikeHtml(expr);
+        if (!htmlish && new RegExp(`^\\s*${esc(name)}\\s*$`).test(expr) && info.assignLine !== info.sourceLine) {
+          htmlish = javaExprLooksLikeHtml(lines[info.assignLine - 1] ?? '');
+        }
+        if (!htmlish) continue;
+        // Suppress only when an xss sanitizer's operand is the returned carrier
+        // (or the carrier local was assigned from that sanitizer). Escaping a
+        // different variable must not clear a return of another carrier.
+        const xssEscapeOpRe =
+          /\b(?:Encode\.(?:forHtml|forHtmlAttribute|forHtmlContent|forJavaScript)|StringEscapeUtils\.escape(?:Html3|Html4|EcmaScript|Xml)|HtmlUtils\.htmlEscape(?:Decimal|Hex)?|Escaper\.escapeHtml|HtmlEscapers\.(?:escapeHtml|htmlEscaper)|Encoder\.encodeForHTML(?:Attribute)?|Jsoup\.clean)\s*\(\s*([A-Za-z_]\w*)/;
+        const sanitizerCoversCarrier = xssSanitizerLines.some(l => {
+          if (l < m.start_line || l > sinkLine) return false;
+          const line = lines[l - 1] ?? '';
+          const ops: string[] = [];
+          let sm: RegExpExecArray | null;
+          const re = new RegExp(xssEscapeOpRe.source, 'g');
+          while ((sm = re.exec(line)) !== null) ops.push(sm[1]);
+          // Unparsed shapes (e.g. static-import `htmlEscape(title)`) do not suppress.
+          if (ops.length === 0) return false;
+          // Operand is the returned carrier.
+          if (ops.some(op => op === name)) return true;
+          // Carrier assigned from the sanitizer call itself (`body = HtmlUtils.htmlEscape(x)`),
+          // not a concat that merely mentions a sanitizer on the assignment line.
+          if (l === info.assignLine) {
+            const stripped = line.replace(/"(?:[^"\\]|\\.)*"/g, '""').trim();
+            const am = new RegExp(`\\b${esc(name)}\\s*=\\s*(.+)$`).exec(stripped);
+            if (!am) return false;
+            const rhs = am[1].replace(/;\s*$/, '').trim();
+            const call = xssEscapeOpRe.exec(rhs);
+            if (!call || call.index !== 0) return false;
+            // Whole RHS is one sanitizer invocation (no concatenation outside the call).
+            let depth = 0;
+            let ended = -1;
+            for (let k = call.index; k < rhs.length; k++) {
+              const ch = rhs[k];
+              if (ch === '(') depth++;
+              else if (ch === ')') {
+                depth--;
+                if (depth === 0) { ended = k; break; }
+              }
+            }
+            return ended >= 0 && rhs.slice(ended + 1).trim() === '';
+          }
+          return false;
+        });
+        if (sanitizerCoversCarrier) continue;
+        out.push({ sinkLine, sourceLine: info.sourceLine });
+      }
+    }
+  }
+  return out;
 }
