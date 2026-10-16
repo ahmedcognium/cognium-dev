@@ -2319,6 +2319,7 @@ function isReassignedToLiteralBetween(
     // A literal assigned in one case of a switch only overwrites the value
     // when no case gives the variable anything else. `case 'A': bar = param;`
     // next to `default: bar = "safe";` leaves `bar` tainted on the 'A' path.
+    if (javaCatchLiteralHasTaintedTryArm(lines, i, variable, strLit, unreachableLines)) continue;
     if (siblingBranchAssignsNonLiteral(lines, i, variable, strLit, unreachableLines)) continue;
     return true;
   }
@@ -2366,6 +2367,44 @@ function matchingClose(lines: string[], line: number, col: number): { line: numb
     }
   }
   return null;
+}
+
+/**
+ * True when line `idx` is a literal assignment in a `catch` block and the
+ * paired `try` assigns `variable` a non-literal value (cognium-dev#753).
+ */
+function javaCatchLiteralHasTaintedTryArm(
+  lines: string[],
+  idx: number,
+  variable: string,
+  strLit: string,
+  unreachableLines?: ReadonlySet<number>,
+): boolean {
+  const block = enclosingBrace(lines, idx, 0);
+  if (!block || !/\bcatch\b/.test(block.header)) return false;
+  let h = block.headerLine;
+  while (h >= 0 && !/\btry\b/.test(lines[h])) h--;
+  if (h < 0) return false;
+  const tryIdx = lines[h].search(/\btry\b/);
+  let openLine = h;
+  let openCol = lines[h].indexOf('{', tryIdx);
+  if (openCol < 0) {
+    openLine = h + 1;
+    while (openLine < lines.length && lines[openLine].trim() === '') openLine++;
+    if (openLine >= lines.length) return false;
+    openCol = lines[openLine].indexOf('{');
+    if (openCol < 0) return false;
+  }
+  const tryEnd = matchingClose(lines, openLine, openCol);
+  if (!tryEnd) return false;
+  const assignTry = new RegExp(`(?:^|[^\\w.$])${variable}\\s*(?::?=)(?!=)\\s*(.*?)\\s*;?\\s*$`);
+  const literalOnly = new RegExp(`^${strLit}$`);
+  for (let i = openLine; i <= tryEnd.line; i++) {
+    if (unreachableLines?.has(i + 1)) continue;
+    const m = assignTry.exec(lines[i]);
+    if (m && m[1] && !literalOnly.test(m[1])) return true;
+  }
+  return false;
 }
 
 /**
@@ -2444,6 +2483,8 @@ function siblingBranchAssignsNonLiteral(
       close = next;
       last = next.line;
     }
+  } else if (/\bcatch\b/.test(block.header)) {
+    return javaCatchLiteralHasTaintedTryArm(lines, idx, variable, strLit, unreachableLines);
   } else {
     return false;
   }
@@ -3221,9 +3262,13 @@ function detectExpressionScanFlows(
           }
           if (best) scopedAnchor = best;
         }
+        // Keep scopedAnchor.line for in_method / preceding-source matching
+        // (#614). Pass derivedLine only for literal-kill (#753), so a safe
+        // sibling method's earlier sink cannot pick up this alias by line.
         sourcesWithVar.push({
           ...scopedAnchor,
           variable: varName,
+          literal_kill_line: derivedLine,
           ...(owner ? { in_method: owner } : {}),
         });
         existingVars.add(varName);
@@ -3728,15 +3773,23 @@ function detectExpressionScanFlows(
             break;
           }
 
-          // Sprint 9 #58.3 / #56: between source.line and sink.line, if
-          // the tainted variable is reassigned to a pure string literal
-          // (either naked `var = "lit"` or guarded by an allowlist check
-          // such as `if (!ALLOWLIST.contains(var)) var = "lit"` /
+          // Sprint 9 #58.3 / #56: between the alias derivation (or source)
+          // line and sink.line, if the tainted variable is reassigned to a
+          // pure string literal (either naked `var = "lit"` or guarded by an
+          // allowlist check such as `if (!ALLOWLIST.contains(var)) var = "lit"` /
           // `if var not in ALLOWLIST: var = "lit"`), the original taint
-          // no longer reaches the sink — suppress the flow.
+          // no longer reaches the sink — suppress the flow. Derived aliases
+          // carry `literal_kill_line` so kill starts at the assignment that
+          // created them (#753), while `source.line` stays on the anchor (#614).
           if (
             typeof code === 'string' &&
-            isReassignedToLiteralBetween(code, source.variable, source.line, sink.line, unreachableLines)
+            isReassignedToLiteralBetween(
+              code,
+              source.variable,
+              source.literal_kill_line ?? source.line,
+              sink.line,
+              unreachableLines,
+            )
           ) {
             break;
           }
