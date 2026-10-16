@@ -56,6 +56,10 @@ export class ConstantPropagator {
   private methodReturnsParameter: Map<string, number> = new Map();
   // Track which methods return safe (non-tainted) values even with tainted input
   private methodReturnsSafeValue: Set<string> = new Set();
+  /** Go locals (method-scoped) that were ever assigned a value const-prop cannot prove clean (#751). */
+  private goUnknownVars: Set<string> = new Set();
+  /** Every method-scoped name handleGoAssignment wrote; these get no unscoped alias in the result. */
+  private goScopedNames: Set<string> = new Set();
   // Additional taint patterns (for test harnesses to inject custom patterns)
   private additionalTaintPatterns: string[] = [];
   // Track list elements by index for precise list taint tracking
@@ -124,6 +128,8 @@ export class ConstantPropagator {
     this.definitionNodes.clear();
     this.inConditionalBranch = false;
     this.methodReturnsConstant.clear();
+    this.goUnknownVars.clear();
+    this.goScopedNames.clear();
     this.methodReturnsSanitized.clear();
     this.localNonSanitizing.clear();
     this.methodReturnsHtmlEncoderOnly.clear();
@@ -213,6 +219,10 @@ export class ConstantPropagator {
     // Add unscoped symbols for backward compatibility with tests
     // The scoped versions take priority in filterCleanVariableSinks
     for (const [name, value] of this.symbols) {
+      // cognium-dev#751: a Go local is only meaningful in its own function. An
+      // unscoped alias would let `query := "SELECT 1"` in one function make
+      // every other function's `query` look clean to the veto.
+      if (this.goScopedNames.has(name)) continue;
       if (name.includes(':')) {
         const unscoped = name.substring(name.indexOf(':') + 1);
         // Only add if not already present (scoped version wins on conflict)
@@ -234,6 +244,7 @@ export class ConstantPropagator {
       lineConditions: new Map(this.lineConditions),
       synchronizedLines: new Set(this.synchronizedLines),
       instanceFieldTaint: new Map(this.instanceFieldTaint),
+      constantReturningMethods: new Set(this.methodReturnsConstant),
     };
   }
 
@@ -330,9 +341,7 @@ export class ConstantPropagator {
 
         hasReachableReturn = true;
 
-        const valueNode = ret.children.find(c =>
-          c.type !== 'return' && c.type !== ';' && c.type !== 'comment'
-        );
+        const valueNode = this.returnExpressionValueNode(ret);
 
         if (!valueNode) {
           allReturnsConstant = false;
@@ -529,6 +538,22 @@ export class ConstantPropagator {
     return null;
   }
 
+  /** Return the expression node from a `return_statement` (Java, Go, Python, …). */
+  private returnExpressionValueNode(ret: Node): Node | undefined {
+    const byField = ret.childForFieldName('result');
+    if (byField) return byField;
+    const candidates = ret.children.filter(
+      (c) => c.type !== 'return' && c.type !== ';' && c.type !== 'comment',
+    );
+    let valueNode: Node | undefined = candidates[0];
+    if (valueNode?.type === 'expression_list') {
+      valueNode = valueNode.children.find(
+        (c) => c.type !== '(' && c.type !== ')' && c.type !== ',',
+      );
+    }
+    return valueNode;
+  }
+
   private getMethodParameters(method: Node): string[] {
     const params: string[] = [];
     const paramsNode = method.childForFieldName('parameters');
@@ -539,6 +564,17 @@ export class ConstantPropagator {
         const nameNode = child.childForFieldName('name');
         if (nameNode) {
           params.push(getNodeText(nameNode, this.source));
+        }
+      } else if (child.type === 'parameter_declaration') {
+        const nameNode = child.childForFieldName('name');
+        if (nameNode) {
+          if (nameNode.type === 'identifier') {
+            params.push(getNodeText(nameNode, this.source));
+          } else {
+            for (const id of nameNode.children) {
+              if (id.type === 'identifier') params.push(getNodeText(id, this.source));
+            }
+          }
         }
       }
     }
@@ -929,6 +965,7 @@ export class ConstantPropagator {
 
     switch (node.type) {
       case 'method_declaration':
+      case 'function_declaration':
       case 'constructor_declaration':
         this.handleMethodDeclaration(node);
         return true; // Don't visit children directly, handleMethodDeclaration does it
@@ -958,6 +995,11 @@ export class ConstantPropagator {
 
       case 'assignment_expression':
         this.handleAssignment(node);
+        return false;
+
+      case 'short_var_declaration':
+      case 'assignment_statement':
+        this.handleGoAssignment(node);
         return false;
 
       case 'update_expression':
@@ -1398,6 +1440,100 @@ export class ConstantPropagator {
         }
       }
     }
+  }
+
+  /**
+   * Go `:=` / `=` (cognium-dev#751).
+   *
+   * Const-prop does not model Go request sources, so a right-hand side it does
+   * not see as tainted is usually just *unknown* (`r.URL.Query().Get("f")`,
+   * `"SELECT " + f`, `r.FormValue("x")`). Recording such a variable as a clean
+   * symbol makes the const-prop veto drop real flows downstream, so only a
+   * right-hand side that is provably clean — a constant, or a call to a local
+   * helper that always returns a constant — clears the variable. Anything else stops being tracked here, which is what Go
+   * assignments got before this handler existed: the DFG decides.
+   */
+  private handleGoAssignment(node: Node): void {
+    const left = node.childForFieldName('left');
+    const right = node.childForFieldName('right');
+    if (!left || !right) return;
+
+    const names: string[] = [];
+    if (left.type === 'identifier') {
+      names.push(getNodeText(left, this.source));
+    } else if (left.type === 'expression_list') {
+      for (const c of left.children) {
+        if (c.type === 'identifier') names.push(getNodeText(c, this.source));
+      }
+    }
+    if (names.length === 0) return;
+
+    // The Go grammar wraps every right-hand side in an `expression_list`, so
+    // pair each name with its own expression (`a, b := x, y`); one expression
+    // for several names (`v, err := f()`) applies to all of them.
+    const rhs =
+      right.type === 'expression_list'
+        ? right.children.filter((c) => c.type !== ',' && c.type !== 'comment')
+        : [right];
+    const line = getNodeLine(node);
+
+    for (let i = 0; i < names.length; i++) {
+      const varName = names[i]!;
+      if (varName === '_') continue;
+      const value = rhs.length === names.length ? rhs[i] : rhs.length === 1 ? rhs[0] : undefined;
+      const scopedName = this.getScopedName(varName);
+      this.goScopedNames.add(scopedName);
+      if (value && this.isTaintedExpression(value)) {
+        this.goUnknownVars.add(scopedName);
+        this.tainted.add(scopedName);
+        this.sanitizedVars.delete(scopedName);
+        this.sanitizedVarUncovered.delete(scopedName);
+        this.definitionNodes.set(scopedName, value);
+        this.symbols.set(scopedName, createUnknown(line));
+        continue;
+      }
+      if (!value || !this.isGoKnownCleanRhs(value) || this.goUnknownVars.has(scopedName)) {
+        // Unknown value: forget what we knew, and do not trust a later clean
+        // assignment either, since const-prop's symbols are not flow-sensitive
+        // and a sink between the two would be vetoed. In a conditional branch
+        // the other path may still carry the old value, so keep any taint.
+        this.goUnknownVars.add(scopedName);
+        this.symbols.delete(scopedName);
+        this.sanitizedVars.delete(scopedName);
+        this.sanitizedVarUncovered.delete(scopedName);
+        if (!this.inConditionalBranch) {
+          this.tainted.delete(scopedName);
+          this.definitionNodes.delete(scopedName);
+        }
+        continue;
+      }
+      // Provably clean, but only on this path: a branch must not clear taint
+      // or make an untracked variable look clean at the join.
+      if (this.inConditionalBranch) {
+        this.goUnknownVars.add(scopedName);
+        this.symbols.delete(scopedName);
+        continue;
+      }
+      this.tainted.delete(scopedName);
+      this.definitionNodes.delete(scopedName);
+      this.symbols.set(scopedName, this.evaluateExpression(value));
+      this.sanitizedVars.delete(scopedName);
+      this.sanitizedVarUncovered.delete(scopedName);
+    }
+  }
+
+  /**
+   * A Go right-hand side whose value is clean regardless of its inputs: a
+   * compile-time constant, or a call to a local helper whose every reachable
+   * return is a constant (#751). Sanitizer-style calls are deliberately not
+   * included: clearing here vetoes every sink type, and Go sanitizers are
+   * sink-specific (`strconv.Atoi` bounds nothing for a `make` size, #349).
+   */
+  private isGoKnownCleanRhs(right: Node): boolean {
+    if (isKnown(this.evaluateExpression(right))) return true;
+    if (right.type !== 'call_expression') return false;
+    const callee = this.extractCallName(right);
+    return callee !== null && this.methodReturnsConstant.has(callee);
   }
 
   private handleAssignment(node: Node): void {
@@ -2497,6 +2633,36 @@ export class ConstantPropagator {
           }
           if (this.isTaintedExpression(objectNode)) {
             return true;
+          }
+        }
+      }
+    }
+
+    if (node.type === 'call_expression' || node.type === 'call') {
+      const methodName = this.extractCallName(node);
+      if (methodName) {
+        if (SANITIZER_METHODS.has(methodName) && !this.localNonSanitizing.has(methodName)) {
+          return false;
+        }
+        if (this.methodReturnsConstant.has(methodName)) {
+          return false;
+        }
+        if (this.methodReturnsSanitized.has(methodName)) {
+          return false;
+        }
+        if (this.methodReturnsSafeValue.has(methodName)) {
+          return false;
+        }
+        const returnedParamIdx = this.methodReturnsParameter.get(methodName);
+        if (returnedParamIdx !== undefined && returnedParamIdx >= 0) {
+          const argsNode = node.childForFieldName('arguments');
+          if (argsNode) {
+            const args = argsNode.children.filter(
+              (c: Node) => c.type !== '(' && c.type !== ')' && c.type !== ','
+            );
+            if (args.length > returnedParamIdx && this.isTaintedExpression(args[returnedParamIdx]!)) {
+              return true;
+            }
           }
         }
       }
