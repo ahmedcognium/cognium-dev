@@ -699,7 +699,10 @@ const CSHARP_BINDING_ATTRS = new Set([
  * Check if a parameter type could carry tainted data in inter-procedural analysis.
  * These are types commonly used to pass user-controlled data between methods.
  */
-function isInterproceduralTaintableType(typeName: string, language?: SupportedLanguage): boolean {
+function isInterproceduralTaintableType(
+  typeName: string,
+  language?: SupportedLanguage,
+): boolean {
   // Normalize type name (remove generics)
   const baseType = typeName.split('<')[0].trim();
 
