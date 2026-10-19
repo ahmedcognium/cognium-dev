@@ -26,6 +26,7 @@ import { walkBackwardDefs } from '../dfg-walk.js';
 import { sanitizerCoversSink } from '../sanitizer-index.js';
 import { HTML_CONTEXT_ENCODER_METHODS } from '../constant-propagation/patterns.js';
 import { javaCanonicalStartsWithAllBare } from '../java-canonical-prefix.js';
+import { shouldGateInterproceduralParam } from '../entry-point-detection.js';
 
 export interface TaintPropagationPassResult {
   flows: TaintFlowInfo[];
@@ -938,7 +939,17 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
 
     // Supplement: direct parameter-to-sink flows
     // Sprint 82 (#189) — sink-type-aware dedup (see arrayFlows comment).
-    const paramFlows = detectParameterSinkFlows(types, calls, sources, sinks, constProp.unreachableLines, constProp.tainted, ctx.code) ?? [];
+    const paramFlows = detectParameterSinkFlows(
+      types,
+      calls,
+      sources,
+      sinks,
+      constProp.unreachableLines,
+      constProp.tainted,
+      ctx.code,
+      ctx.language,
+      graph.ir.meta.file,
+    ) ?? [];
     for (const f of paramFlows) {
       pushIfNew(f);
     }
@@ -1058,6 +1069,24 @@ export class TaintPropagationPass implements AnalysisPass<TaintPropagationPassRe
       if (sanitizedNames.has(sourceVar) && coversFlow(sourceVar)) return false;
       return true;
     });
+
+    if (ctx.language === 'csharp') {
+      finalFlows = finalFlows.filter(
+        (f) =>
+          !shouldGateCSharpPatPermsLibraryParamFlow(
+            f,
+            sources,
+            sinks,
+            types,
+            {
+              language: ctx.language,
+              types,
+              filePath: graph.ir.meta.file,
+              calls,
+            },
+          ),
+      );
+    }
 
     // Sprint 24 (cognium-dev #102) — uniform line-keyed sanitizer
     // suppression. Drop any flow whose sink_line carries a registered
@@ -2188,6 +2217,60 @@ function detectArrayElementFlows(
   return flows;
 }
 
+/**
+ * cognium-dev #816 — PAT-PERMS-01: suppress only direct library-parameter →
+ * FileStream path_traversal on non-entry methods. Derived paths (Path.Combine,
+ * GetFullPath chains) and other sinks stay gated only by sanitizer / DFG logic.
+ */
+function csharpPatPermsDirectParamSink(
+  sink: CircleIR['taint']['sinks'][0],
+  paramVar: string,
+): boolean {
+  const method = (sink.method ?? '').replace(/^.*\./, '');
+  if (method !== 'FileStream') return false;
+  const code = (sink as { code?: string }).code ?? '';
+  if (!code) return true;
+  const escaped = paramVar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\bFileStream\\s*\\(\\s*${escaped}\\b`).test(code);
+}
+
+function shouldGateCSharpPatPermsLibraryParamFlow(
+  flow: TaintFlowInfo,
+  sources: CircleIR['taint']['sources'],
+  sinks: CircleIR['taint']['sinks'],
+  types: CircleIR['types'],
+  ctx: {
+    language?: string;
+    types?: CircleIR['types'];
+    filePath?: string;
+    calls?: CircleIR['calls'];
+  },
+): boolean {
+  if (flow.source_type !== 'interprocedural_param' || flow.sink_type !== 'path_traversal') {
+    return false;
+  }
+  const srcVar = flow.path?.[0]?.variable;
+  const sinkVar = flow.path?.[flow.path.length - 1]?.variable;
+  if (!srcVar || srcVar !== sinkVar) return false;
+  const sink = sinks.find(
+    (s) => s.line === flow.sink_line && s.type === 'path_traversal',
+  );
+  if (!sink || !csharpPatPermsDirectParamSink(sink, srcVar)) return false;
+  const src = sources.find(
+    (s) => s.line === flow.source_line && s.type === 'interprocedural_param',
+  );
+  const methodName = src?.in_method;
+  if (!methodName) return false;
+  const enclosingType = types.find((t) => t.methods.some((m) => m.name === methodName));
+  const enclosingMethod = enclosingType?.methods.find((m) => m.name === methodName);
+  return shouldGateInterproceduralParam(
+    flow.source_type,
+    enclosingMethod,
+    enclosingType,
+    ctx,
+  );
+}
+
 /** Parameter names referenced as identifiers inside a compound sink argument (#685). */
 function compoundArgParamNames(expression: string, paramNames: Iterable<string>): string[] {
   const stripped = expression.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, (m) => ' '.repeat(m.length));
@@ -2211,6 +2294,8 @@ function detectParameterSinkFlows(
   unreachableLines: Set<number>,
   tainted: Set<string>,
   code?: string,
+  language?: string,
+  filePath?: string,
 ): CircleIR['taint']['flows'] {
   const flows: CircleIR['taint']['flows'] = [];
 
@@ -2260,6 +2345,27 @@ function detectParameterSinkFlows(
         for (const varName of varNames) {
           const paramSource = methodParamSources.get(varName);
           if (paramSource) {
+            if (
+              language === 'csharp' &&
+              paramSource.type === 'interprocedural_param' &&
+              sink.type === 'path_traversal' &&
+              csharpPatPermsDirectParamSink(sink, varName)
+            ) {
+              const enclosingType = types.find((t) =>
+                t.methods.some((m) => m.name === methodName),
+              );
+              const enclosingMethod = enclosingType?.methods.find((m) => m.name === methodName);
+              if (
+                shouldGateInterproceduralParam(
+                  paramSource.type,
+                  enclosingMethod,
+                  enclosingType,
+                  { language, types, filePath, calls },
+                )
+              ) {
+                continue;
+              }
+            }
             // Sprint 82 (#189) — sink-type-aware dedup so a sink registered
             // under multiple types at the same call site (e.g. `redirect` as
             // both `open_redirect` and `crlf`) emits a flow for each type.
