@@ -1237,6 +1237,13 @@ export class CrossFileResolver {
             }
           }
 
+          // 2b.5 — cognium-dev#590: wrapper-return marks the assignment LHS tainted,
+          //     but caller-body sinks often consume a derived local (`sql = "…" + x`).
+          //     Extend the tainted set with DFG-reachable names before sink matching.
+          if (tainted.size > 0) {
+            this.extendInterproceduralTaintedVars(callerIR, callerFile, tainted);
+          }
+
           // 2c. Caller-body sinks: after marking locals tainted via wrapper-return,
           //     check whether any sink in the CALLER'S OWN method body consumes a
           //     tainted variable. This closes the canonical Jenkins shape where the
@@ -1729,6 +1736,40 @@ export class CrossFileResolver {
   /**
    * Find which method a tainted arg expression references.
    */
+  /**
+   * After cross-file wrapper-return seeding (step 2a), add same-file locals
+   * DFG-derived from that assignment so caller-body sinks see `sql` as well
+   * as `invoice` (cognium-dev#590). In-method sources already reach derived
+   * names via `findCrossFileTaintFlows` / `collectTaintReachable`; extending
+   * those here duplicates paths and emits `external_taint_escape` on calls
+   * that bypass pass-level suppressions (cognium-dev#412).
+   */
+  private extendInterproceduralTaintedVars(
+    callerIR: CircleIR,
+    callerFile: string,
+    tainted: Map<string, {
+      file: string;
+      line: number;
+      type: string;
+      hopChain: InterproceduralTaintPath['hops'];
+      defIds?: Set<number>;
+    }>,
+  ): void {
+    for (const [varName, origin] of [...tainted.entries()]) {
+      const wrapperHop = origin.hopChain.find(
+        h => h.kind === 'wrapper_return' && h.file === callerFile,
+      );
+      if (!wrapperHop) continue;
+      const anchorLine = wrapperHop.line;
+
+      const reachable = this.collectTaintReachable(callerIR, varName, anchorLine, callerFile);
+      for (const derived of reachable.names) {
+        if (derived === varName || tainted.has(derived)) continue;
+        tainted.set(derived, { ...origin, defIds: reachable.defIds });
+      }
+    }
+  }
+
   private matchTaintedArg(
     arg: { variable?: string | null; expression?: string },
     tainted: Map<string, { file: string; line: number; type: string; hopChain: InterproceduralTaintPath['hops']; defIds?: Set<number> }>,
