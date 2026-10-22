@@ -23,6 +23,11 @@ concurrency:
 # self-hosted `grace` node (registered per-repo at /opt/gh-runners/cognium-dev,
 # running as `ghrunner`), while the cheap independent jobs stay GitHub-hosted
 # rather than queueing behind it.
+#
+# Fork PRs never reach `grace`: this repo is public, and a fork PR's code would
+# otherwise run on a persistent box we own. They run the same build/test jobs on
+# ubuntu-latest instead. Skipping them would be worse, because a skipped job
+# satisfies a required check, so the fork PR would look green without tests.
 
 jobs:
   lint:
@@ -53,7 +58,7 @@ jobs:
 
   build:
     name: build + typecheck
-    runs-on: [self-hosted, grace]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "grace"]') }}
     # Container: the runner is persistent, unlike a GitHub-hosted one, so
     # without this the jobs share ~/.npm and leftover node_modules with every
     # other repo on the box. Must stay a glibc image (not alpine):
@@ -92,7 +97,7 @@ jobs:
 
   test:
     name: test — ${{ matrix.package }}
-    runs-on: [self-hosted, grace]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "grace"]') }}
     container:
       image: node:22-bookworm
     timeout-minutes: 30
