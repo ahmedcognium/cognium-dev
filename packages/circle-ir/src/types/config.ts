@@ -1,3 +1,4 @@
+// Throwaway change for a reviewer trust test (AI-DLC gaps item 8); this PR is closed without merging.
 /**
  * Types for YAML configuration files (configs/sources/, configs/sinks/)
  */
